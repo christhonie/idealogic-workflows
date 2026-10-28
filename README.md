@@ -50,11 +50,15 @@ of the route workflows (`ado-organisation`, `ado-project`). None of these is a s
 | `dependencygraph.yml` | Submit dependency snapshot to GitHub |
 | `argocd-update.yml` | Update ArgoCD manifest with new image tag |
 | `gitflow-release-finish.yml` | Complete GitFlow release (tag, merge, bump version) |
-| `manual-release-start.yml` | Start GitFlow release branch (manual dispatch) |
 | `copilot-review.yml` | Request a Copilot code review on a new pull request |
 | `merge-eligibility.yml` | Keep the `ready-to-merge` label true to reviews, answered threads and green checks |
 | `resolve-merged.yml` | On a merge into develop, move the Azure DevOps items the PR names to Resolved and create their Testing tasks |
 | `mark-released.yml` | On a release, write `Released In`, the release comment and the on-environment comments on the items it shipped |
+
+Not here: `manual-release-start.yml`, the GitFlow release-start trigger. It is a
+`workflow_dispatch` workflow, not a reusable one, and each repository carries its own
+copy (for example `christhonie/event`). Making it reusable, with a thin dispatch caller
+per repository, is a later cleanup.
 
 ## Data Flow and Caching
 
@@ -114,7 +118,6 @@ The built-in `setup-java` cache uses only `pom.xml` hash as the key. This causes
 - `dependencygraph.yml`
 - `helm-build.yml`
 - `gitflow-release-finish.yml`
-- `manual-release-start.yml`
 
 ### 2. Target Directory Cache
 
@@ -230,8 +233,7 @@ SNAPSHOTs and run Maven with `-U`. Currently this applies to `test-be.yml` and
 3. Maven runs with `-U` to force update checks
 
 Other workflows (`docker-build.yml`, `helm-build.yml`, `maven-deploy.yml`,
-`publish.yml`, `dependencygraph.yml`, `gitflow-release-finish.yml`,
-`manual-release-start.yml`) cache `~/.m2/repository` for speed but may serve
+`publish.yml`, `dependencygraph.yml`, `gitflow-release-finish.yml`) cache `~/.m2/repository` for speed but may serve
 stale SNAPSHOTs. Add the purge + `-U` pattern where SNAPSHOT freshness matters.
 
 ### Deploy fails with `409 Conflict`
