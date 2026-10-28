@@ -1,0 +1,179 @@
+name: '🧾 Resolve Merged'
+# When a pull request merges into `develop`, move the Azure DevOps work items it names to Resolved
+# (Tasks to Closed, which have no Resolved state), link the pull request in a comment, and create
+# one Testing task per acceptance criterion of each Story (one "verify the fix" task per Bug), so
+# the "to test on stage" list exists the moment the change is on develop.
+#
+# This is the resolver of the software factory's pull-request lifecycle route (R4). It is a
+# deterministic script, not a model: parsing ids and copying bullets into Tasks is a rule. It runs
+# as the factory's dispatcher principal through a federated credential — no secret in GitHub.
+#
+# Ids are read from the head branch and the title: `ADO-<id>` (EMS convention) and
+# `agent-smith/<id>` (Agent Smith's branch form), de-duplicated. A PR naming no item does nothing
+# and says so. Everything is idempotent: an item already Resolved or Closed is left alone, and a
+# Testing task whose title already exists under the parent is not created twice.
+#
+# Callers: on `pull_request` closed-and-merged into develop, and `workflow_dispatch` with a PR
+# number for a missed merge.
+
+on:
+  workflow_call:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+        type: number
+      ado-organisation:
+        description: 'Azure DevOps organisation (the <org> of https://dev.azure.com/<org>)'
+        required: false
+        type: string
+        default: 'idealogic-za'
+      ado-project:
+        description: 'Azure DevOps project that holds the work items'
+        required: false
+        type: string
+        default: 'Event Membership'
+
+# Account constants. Not inputs yet: one account uses these workflows. To serve a second account,
+# turn each into a workflow_call input with this value as its default.
+env:
+  AZURE_CLIENT_ID: d45874b4-1e85-45ff-a740-42196b6d8da8    # ems-factory-dispatcher, the factory's dispatcher principal (not a secret)
+  AZURE_TENANT_ID: e0fd5785-e83e-439e-b7e7-5bfb0b2e8a84
+
+jobs:
+  resolve:
+    name: '🧾 Resolve the merged PR’s work items'
+    runs-on: ubuntu-latest
+    # One run at a time per repository and PR (a merge-triggered run and a manual replay of the
+    # same PR serialise). Two repositories merging changes for one Story cannot share a group, so
+    # the script also re-reads the parent's children after creating tasks and marks any duplicate
+    # Testing title Removed, keeping the lowest id.
+    concurrency:
+      group: resolve-merged-${{ github.repository }}-${{ inputs.pr }}
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: read
+    steps:
+    - uses: azure/login@v2
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        allow-no-subscriptions: true
+
+    - name: Read the pull request
+      id: pr
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ inputs.pr }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        gh pr view "$PR" --repo "$REPO" --json number,title,headRefName,baseRefName,mergedAt,mergeCommit,url,state > pr.json
+        jq -r '"\(.state) merged=\(.mergedAt // "no") base=\(.baseRefName) head=\(.headRefName)"' pr.json
+
+    - name: Resolve items and create Testing tasks
+      env:
+        ADO_ORG: ${{ inputs.ado-organisation }}
+        ADO_PROJECT: ${{ inputs.ado-project }}
+        REPO: ${{ github.repository }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        TOKEN=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 -o tsv --query accessToken)
+        export TOKEN
+        python3 - <<'PY'
+        import json, os, re, html, sys, urllib.parse, urllib.request, urllib.error
+        ORG="https://dev.azure.com/"+os.environ["ADO_ORG"]; P=urllib.parse.quote(os.environ["ADO_PROJECT"])
+        H={"Authorization":"Bearer "+os.environ["TOKEN"]}
+        pr=json.load(open("pr.json"))
+        summary=[f"### Resolver — {os.environ['REPO']}#{pr['number']}", ""]
+        def out(line): print(line); summary.append(f"- {line}")
+        if not pr.get("mergedAt") or pr.get("baseRefName")!="develop":
+            out(f"not a merge into develop (state={pr['state']}, base={pr.get('baseRefName')}); nothing to do")
+            open(os.environ["GITHUB_STEP_SUMMARY"],"a").write("\n".join(summary)+"\n"); sys.exit(0)
+        text=pr["headRefName"]+" "+pr["title"]
+        ids=sorted({int(x) for x in re.findall(r"ADO[- ]?#?(\d+)\b",text,re.I)} | {int(x) for x in re.findall(r"agent-smith/(\d+)\b",text,re.I)})
+        if not ids:
+            out("no work item id in the branch or title; nothing to do"); open(os.environ["GITHUB_STEP_SUMMARY"],"a").write("\n".join(summary)+"\n"); sys.exit(0)
+        def api(method,url,body=None,ct="application/json"):
+            req=urllib.request.Request(url,data=(json.dumps(body).encode() if body is not None else None),method=method,headers={**H,"Content-Type":ct})
+            with urllib.request.urlopen(req,timeout=60) as r: return json.load(r)
+        def patch(i,ops): return api("PATCH",f"{ORG}/{P}/_apis/wit/workitems/{i}?api-version=7.1",ops,"application/json-patch+json")
+        sha=(pr.get("mergeCommit") or {}).get("oid","")[:10]
+        link=f'<a href="{pr["url"]}">{os.environ["REPO"]}#{pr["number"]}</a>'
+        def _items(htmltext):
+            items=re.findall(r"<li[^>]*>(.*?)</li>",htmltext,re.S|re.I)
+            if not items:
+                items=re.split(r"<br\s*/?>|</p>|</div>|\n",htmltext)
+            clean=[]
+            for it in items:
+                t=html.unescape(re.sub(r"<[^>]+>","",it))
+                t=re.sub(r"^\s*(?:[-•*]\s*)?\[\s*[xX ]?\s*\]\s*","",t).strip(" \t\r\n-•*")   # checklist markers
+                if len(t)>2: clean.append(t)
+            return clean
+        def criteria(fields):
+            # 1. the Acceptance Criteria field; 2. an "Acceptance Criteria" section of the Description
+            ac=fields.get("Microsoft.VSTS.Common.AcceptanceCriteria")
+            if ac and _items(ac): return _items(ac)
+            # Descriptions are Markdown ("## Acceptance Criteria" + "- [ ]" lines) or HTML (<h2>/<b> heading)
+            d=fields.get("System.Description") or ""
+            m=re.search(r"(?im)^(?:#{1,6}\s*|<h\d[^>]*>\s*|<(?:b|strong)[^>]*>\s*)Acceptance\s+Criteria\s*(?:</h\d>|</(?:b|strong)>)?\s*$",d) or \
+              re.search(r"(?i)Acceptance\s+Criteria\s*(?:</h\d>|</(?:b|strong)>|:)",d)
+            if not m: return []
+            rest=d[m.end():]
+            # the section ends at the next heading; inline <b> inside a bullet is not a heading
+            nxt=re.search(r"(?m)^#{1,6}\s|<h\d[^>]*>|(?:<div>|<p>|<br>\s*)<(?:b|strong)[^>]*>[^<]{3,60}</(?:b|strong)>\s*(?:</div>|</p>|<br)",rest)
+            section=rest[:nxt.start()] if nxt else rest
+            return _items(section)
+        for i in ids:
+            try: w=api("GET",f"{ORG}/{P}/_apis/wit/workitems/{i}?$expand=relations&api-version=7.1")
+            except urllib.error.HTTPError as e:
+                if e.code==404: out(f"#{i}: not found; skipped"); continue
+                raise   # 401/403/429/5xx fail the run so it is red and can be re-dispatched
+            f=w["fields"]; typ=f["System.WorkItemType"]; state=f["System.State"]; title=f["System.Title"]
+            if typ in ("Epic","Feature","Goal"): out(f"#{i} {typ}: not resolved by a merge; skipped"); continue
+            target="Closed" if typ=="Task" else "Resolved"
+            if state in ("Resolved","Closed","Removed"): out(f"#{i} {typ} already {state}; state untouched")
+            else:
+                patch(i,[{"op":"add","path":"/fields/System.State","value":target},
+                         {"op":"add","path":"/fields/System.History","value":f"<div>Merged into develop: {link} (merge {sha}). Set to {target} by the factory resolver (<a href=\"{os.environ['RUN_URL']}\">run</a>).</div>"}])
+                out(f"#{i} {typ}: {state} → {target}")
+            if typ not in ("User Story","Bug"): continue
+            # existing Testing children
+            child_ids=[int(r["url"].rsplit("/",1)[1]) for r in w.get("relations",[]) if r.get("rel")=="System.LinkTypes.Hierarchy-Forward"]
+            existing=set()
+            if child_ids:
+                b=api("POST",f"{ORG}/{P}/_apis/wit/workitemsbatch?api-version=7.1",{"ids":child_ids,"fields":["System.Title","Microsoft.VSTS.Common.Activity"],"errorPolicy":"omit"})
+                existing={c["fields"]["System.Title"] for c in b["value"] if c["fields"].get("Microsoft.VSTS.Common.Activity")=="Testing"}
+            prefix=(re.match(r"^\s*(\[[^\]]+\])",title) or [None,""])[1]
+            full=criteria(f) if typ=="User Story" else [f"The fix for: {re.sub(r'^\s*\[[^\]]+\]\s*','',title)}"]
+            wanted=[(f"{prefix} Verify: {c}".strip()[:255], c) for c in full] if typ=="User Story" else [(f"{prefix} Verify the fix on stage: {re.sub(r'^\s*\[[^\]]+\]\s*','',title)}".strip()[:255], full[0])]
+            created=0
+            for t,c in wanted:
+                if t in existing: continue
+                body=[{"op":"add","path":"/fields/System.Title","value":t},
+                      {"op":"add","path":"/fields/System.AreaPath","value":f["System.AreaPath"]},
+                      {"op":"add","path":"/fields/Microsoft.VSTS.Common.Activity","value":"Testing"},
+                      {"op":"add","path":"/fields/System.Description","value":f"<div><b>Criterion.</b> {html.escape(c)}</div><div>Check this once the parent's change is on an environment (stage first). Created by the factory resolver from the parent's acceptance criteria after {link} merged. Close with the observation in a comment.</div>"},
+                      {"op":"add","path":"/relations/-","value":{"rel":"System.LinkTypes.Hierarchy-Reverse","url":f"{ORG}/_apis/wit/workItems/{i}"}}]
+                api("POST",f"{ORG}/{P}/_apis/wit/workitems/$Task?api-version=7.1",body,"application/json-patch+json"); created+=1
+            out(f"#{i}: Testing tasks created {created}, already present {len(wanted)-created}")
+            # Post-creation check: a concurrent run on the same parent may have created the same titles.
+            if created:
+                w2=api("GET",f"{ORG}/{P}/_apis/wit/workitems/{i}?$expand=relations&api-version=7.1")
+                kids=[int(r["url"].rsplit("/",1)[1]) for r in w2.get("relations",[]) if r.get("rel")=="System.LinkTypes.Hierarchy-Forward"]
+                b=api("POST",f"{ORG}/{P}/_apis/wit/workitemsbatch?api-version=7.1",{"ids":kids,"fields":["System.Title","Microsoft.VSTS.Common.Activity","System.State"],"errorPolicy":"omit"})
+                seen={}
+                for c in sorted(b["value"],key=lambda c:c["id"]):
+                    cf=c["fields"]
+                    if cf.get("Microsoft.VSTS.Common.Activity")!="Testing" or cf.get("System.State")=="Removed": continue
+                    t=cf["System.Title"]
+                    if t in seen:
+                        patch(c["id"],[{"op":"add","path":"/fields/System.State","value":"Removed"},
+                                       {"op":"add","path":"/fields/System.History","value":f"<div>Duplicate of #{seen[t]} created by a concurrent resolver run; set to Removed by the resolver.</div>"}])
+                        out(f"#{i}: duplicate Testing task #{c['id']} removed (kept #{seen[t]})")
+                    else: seen[t]=c["id"]
+        open(os.environ["GITHUB_STEP_SUMMARY"],"a").write("\n".join(summary)+"\n")
+        PY

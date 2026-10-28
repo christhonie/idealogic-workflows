@@ -1,0 +1,134 @@
+name: '✅ Test Back-end'
+
+on: 
+  workflow_call:
+    inputs:
+      maven-profiles:
+        description: 'Profile to activate during packaging. Defaults to dev.'
+        required: false
+        type: string
+        default: 'dev'
+      jdk-version:
+        description: 'JDK version to use. Defaults to 17.'
+        required: false
+        type: string
+        default: '17'
+      sonar:
+        description: >-
+          Publish test results and JaCoCo coverage to SonarQube after the verify step. The
+          consumer must supply the SONAR_TOKEN secret and a sonar-project.properties that
+          sets sonar.host.url and sonar.projectKey. Defaults to false.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      MAVEN_PASSWORD: 
+        required: true
+      SONAR_TOKEN:
+        required: false
+
+# Account constants. Not inputs yet: one account uses these workflows. To serve a second account,
+# turn each into a workflow_call input with this value as its default.
+env:
+  MAVEN_SERVER_ID: github-christhonie    # distributionManagement/repository/id in the parent POM
+  MAVEN_USERNAME: christhonie
+
+jobs:
+  test-be:
+    name: '✅ Test'
+    runs-on: ubuntu-latest
+    # Headroom over the slowest consumer. Measured on admin-service develop
+    # (2026-08-23/24, three consecutive green runs): 13.8 / 14.0 / 14.0 min. Every
+    # other consumer is under 3 min. The failsafe IT suite keeps growing — the
+    # per-test identity-table reset + concurrency IT added for ADO-969 is already
+    # in that 14 min — so the old 20 min cap left only ~6 min of margin. 30 gives
+    # roughly 2x the measured baseline.
+    #
+    # This is a ceiling, not a reservation: raising it does not extend or bill a
+    # job that finishes earlier.
+    timeout-minutes: 30
+
+    env:
+      SPRING_OUTPUT_ANSI_ENABLED: DETECT
+      SPRING_JPA_SHOW_SQL: false
+      JHI_DISABLE_WEBPACK_LOGS: true
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        # SonarQube reads git blame to decide which lines count as new code; a shallow
+        # clone makes every line look new. The string '0' is deliberate: a bare 0 is
+        # falsy in an expression and would fall through to the '1'.
+        fetch-depth: ${{ inputs.sonar && '0' || '1' }}
+
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: ${{ inputs.jdk-version }}
+        distribution: 'temurin'
+        server-id: ${{ env.MAVEN_SERVER_ID }} # Value of the distributionManagement/repository/id field of the pom.xml
+        server-username: MAVEN_USERNAME # env variable for username in deploy
+        server-password: MAVEN_PASSWORD # env variable for token in deploy
+
+    # Cache Maven dependencies with run_id to ensure SNAPSHOT dependencies are refreshed each build
+    # while still benefiting from cache for stable dependencies via restore-keys fallback
+    - name: Cache Maven dependencies
+      uses: actions/cache@v6
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-
+          ${{ runner.os }}-maven-
+
+    - name: Remove cached SNAPSHOT dependencies
+      # mkdir guards the first ever run on a fresh repo, before any cache exists
+      # — find on a missing directory exits 1 and fails the job.
+      run: |
+        mkdir -p $HOME/.m2/repository
+        find $HOME/.m2/repository -type d -name '*SNAPSHOT' -exec rm -rf {} +
+
+    - name: Run enforcer checks
+      run: mvn enforcer:display-info --batch-mode --no-transfer-progress
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+
+    - name: Run JavaDoc tests
+      # Doclint findings here are advisory: every service sets failOnError=false on
+      # maven-javadoc-plugin, so this step reports BUILD SUCCESS no matter how many it
+      # emits. Left alone, setup-java's problem matcher turns each "error:" line into a
+      # failure-level annotation, so a passing step — and a green run — looks broken.
+      # That misreading cost a full misdiagnosis of a develop outage (ADO #1272), so the
+      # label is rewritten to something the matcher does not claim. Nothing is hidden:
+      # every line stays in this log, and the matcher stays armed for the steps below,
+      # where a compiler error genuinely does fail the build. ADO #1282 tracks settling
+      # the underlying doclint/failOnError contradiction.
+      run: |
+        set -o pipefail
+        mvn javadoc:javadoc --batch-mode --no-transfer-progress 2>&1 | sed 's/: error: /: doclint: /'
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+
+    - name: Verify the application
+      run: mvn verify -P-webapp,${{ inputs.maven-profiles }} -U --batch-mode --no-transfer-progress -Dlogging.level.ROOT=OFF -Dlogging.level.org.zalando=OFF -Dlogging.level.tech.jhipster=OFF -Dlogging.level.org.springframework=OFF -Dlogging.level.org.springframework.web=OFF -Dlogging.level.org.springframework.security=OFF
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+        NODE_AUTH_TOKEN: ${{ secrets.MAVEN_PASSWORD }} #Assuming the same repo is used.
+
+    # Runs in this job because the JaCoCo and surefire/failsafe reports exist only in this
+    # runner's target/. `initialize` is load-bearing: properties-maven-plugin loads
+    # sonar-project.properties in that phase, and without it the scanner falls back to
+    # SonarCloud. Advisory by design — a SonarQube outage must not block packaging and the
+    # dev deployment — so a failure shows as a warning on the run, not a red build.
+    - name: SonarQube analysis
+      if: inputs.sonar
+      continue-on-error: true
+      run: mvn initialize sonar:sonar -P-webapp,${{ inputs.maven-profiles }} --batch-mode --no-transfer-progress
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

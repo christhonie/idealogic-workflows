@@ -1,0 +1,135 @@
+name: '✈ Maven Deploy'
+
+on: 
+  workflow_call:
+    inputs:
+      maven-profiles:
+        description: 'Comma-separated profiles to activate during deploy. Defaults to dev. Pass an empty string for projects that define no profiles.'
+        required: false
+        type: string
+        default: 'dev'
+      jdk-version:
+        description: 'JDK version to use. Defaults to 17.'
+        required: false
+        type: string
+        default: '17'
+    secrets:
+      MAVEN_PASSWORD:
+        required: true
+
+# Account constants. Not inputs yet: one account uses these workflows. To serve a second account,
+# turn each into a workflow_call input with this value as its default.
+env:
+  MAVEN_SERVER_ID: github-christhonie    # distributionManagement/repository/id in the parent POM
+  MAVEN_USERNAME: christhonie
+
+jobs:
+  deploy:
+    name: '✈ Deploy'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: ${{ inputs.jdk-version }}
+        distribution: 'temurin'
+        server-id: ${{ env.MAVEN_SERVER_ID }} # Value of the distributionManagement/repository/id field of the pom.xml
+        server-username: MAVEN_USERNAME # env variable for username in deploy
+        server-password: MAVEN_PASSWORD # env variable for token in deploy
+
+    # Cache Maven dependencies. Stable deps are reused via restore-keys fallback.
+    # SNAPSHOTs may be served stale — workflows that need fresh SNAPSHOTs
+    # (test-be.yml, maven-package.yml) explicitly purge them and run Maven with -U.
+    - name: Cache Maven dependencies
+      uses: actions/cache@v6
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-
+          ${{ runner.os }}-maven-
+
+    - name: Recover cached target dir
+      id: target-restore
+      uses: actions/cache/restore@v6
+      with:
+        path: target
+        key: ${{ runner.os }}-jdk${{ inputs.jdk-version }}-target-${{ github.run_id }}
+
+    # This workflow runs on every push to main, but main's <revision> only changes
+    # when a release lands. Every maintenance push to main therefore re-attempts a
+    # deploy of a version that is already published, and GitHub Packages rejects
+    # overwriting a release version with "status code: 409, reason phrase: Conflict".
+    # That turned main red on every non-release push from 2026-04-30 onward.
+    #
+    # Release versions are immutable by design, so a re-deploy has nothing to do:
+    # detect the case up front and skip. SNAPSHOTs are always deployable (they are
+    # meant to be overwritten), so they short-circuit to deploy without a lookup.
+    - name: Check whether this version is already published
+      id: published
+      run: |
+        set -euo pipefail
+
+        VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+        case "$VERSION" in
+          *-SNAPSHOT)
+            echo "$VERSION is a SNAPSHOT — always deployable."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+            ;;
+        esac
+
+        GROUP_ID=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout)
+        ARTIFACT_ID=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+        REPO_URL=$(mvn help:evaluate -Dexpression=project.distributionManagement.repository.url -q -DforceStdout)
+        GROUP_PATH=${GROUP_ID//./\/}
+        POM_URL="${REPO_URL%/}/${GROUP_PATH}/${ARTIFACT_ID}/${VERSION}/${ARTIFACT_ID}-${VERSION}.pom"
+
+        echo "Probing $POM_URL"
+        # curl already writes 000 to stdout when it cannot reach the host, so a
+        # `|| echo 000` fallback would concatenate into 000000. Capture the exit
+        # status separately instead and keep HTTP_CODE exactly three digits.
+        set +e
+        HTTP_CODE=$(curl -sSL -o /dev/null -w '%{http_code}' \
+          -u "${MAVEN_USERNAME}:${MAVEN_PASSWORD}" "$POM_URL")
+        CURL_STATUS=$?
+        set -e
+        if [ "$CURL_STATUS" -ne 0 ]; then
+          HTTP_CODE='000'
+        fi
+
+        case "$HTTP_CODE" in
+          200)
+            echo "::notice title=Deploy skipped::${GROUP_ID}:${ARTIFACT_ID}:${VERSION} is already published. Release versions are immutable, so there is nothing to deploy."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            ;;
+          404)
+            echo "$VERSION is not yet published — proceeding with deploy."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            ;;
+          *)
+            # Anything else (401/403/000/5xx) means the probe itself is unreliable.
+            # Fall through to the deploy rather than silently skipping a real release.
+            echo "::warning::Could not determine publication state (HTTP $HTTP_CODE) — attempting the deploy anyway."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            ;;
+        esac
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+
+    - name: Publish to GitHub Packages
+      if: steps.published.outputs.skip != 'true'
+      run: mvn package deploy --batch-mode --no-transfer-progress -DskipTests ${MAVEN_PROFILES:+-P"$MAVEN_PROFILES"}
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+        MAVEN_PROFILES: ${{ inputs.maven-profiles }}

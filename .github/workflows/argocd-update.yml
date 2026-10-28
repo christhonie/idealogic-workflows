@@ -1,0 +1,215 @@
+name: '🚀 Update ArgoCD Image Tag'
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment (dev or stage)'
+        required: true
+        type: string
+      service-name:
+        description: 'Service name in ArgoCD manifest (e.g., event-admin-service)'
+        required: true
+        type: string
+      image-tag:
+        description: 'Docker image tag to deploy (optional — chart appVersion is used when omitted)'
+        required: false
+        type: string
+        default: ''
+      build-sha:
+        description: 'Git commit SHA to force rollout via pod annotation (for SNAPSHOT builds)'
+        required: false
+        type: string
+        default: ''
+      chart-version:
+        description: 'Helm chart version to deploy (updates spec.source.targetRevision)'
+        required: false
+        type: string
+        default: ''
+      argocd-repo:
+        description: 'ArgoCD repository (owner/name)'
+        required: false
+        type: string
+        default: 'christhonie/idl-xnl-jhb-rc01'
+      spa-url:
+        description: >-
+          Public base URL of a SPA-serving service (e.g. https://admin-portal-stage.idealogic.co.za).
+          When set, the deploy is followed by a check that the rolled-out image revalidates
+          index.html correctly (US #1019). Leave empty for services that do not serve a SPA —
+          the check is then skipped entirely.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      ARGOCD_REPO_TOKEN:
+        required: true
+
+jobs:
+  update-argocd:
+    name: '📝 Update ${{ inputs.environment }}'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout ArgoCD repo
+      uses: actions/checkout@v7
+      with:
+        repository: ${{ inputs.argocd-repo }}
+        token: ${{ secrets.ARGOCD_REPO_TOKEN }}
+        path: argocd-repo
+
+    - name: Install yq
+      run: |
+        YQ_VERSION=v4.52.4
+        YQ_SHA256=0c4d965ea944b64b8fddaf7f27779ee3034e5693263786506ccd1c120f184e8c
+        sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+        echo "${YQ_SHA256}  /usr/local/bin/yq" | sha256sum -c -
+        sudo chmod +x /usr/local/bin/yq
+
+    - name: Update ArgoCD manifest
+      run: |
+        cd argocd-repo
+        MANIFEST="argocd/${{ inputs.service-name }}-${{ inputs.environment }}.yml"
+
+        # When image-tag is provided, override the chart's default appVersion.
+        if [ -n "${{ inputs.image-tag }}" ]; then
+          yq -i '(.spec.source.helm.valuesObject.image.tag) = "${{ inputs.image-tag }}"' "$MANIFEST"
+        fi
+
+        # When chart-version is provided, update the Helm chart targetRevision
+        # so ArgoCD pulls the matching chart from the OCI registry.
+        if [ -n "${{ inputs.chart-version }}" ]; then
+          yq -i '(.spec.source.targetRevision) = "${{ inputs.chart-version }}"' "$MANIFEST"
+        fi
+
+        # When build-sha is provided, set a pod annotation to force a rollout
+        # even when the image tag hasn't changed (e.g. SNAPSHOT rebuilds).
+        if [ -n "${{ inputs.build-sha }}" ]; then
+          yq -i '(.spec.source.helm.valuesObject.podAnnotations."app.kubernetes.io/build-sha") = "${{ inputs.build-sha }}"' "$MANIFEST"
+        fi
+
+    - name: Commit and push
+      run: |
+        cd argocd-repo
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git add argocd/${{ inputs.service-name }}-${{ inputs.environment }}.yml
+        git diff --staged --quiet && exit 0
+        # Use chart-version for commit message when available, fall back to image-tag
+        VERSION="${{ inputs.chart-version }}"
+        VERSION="${VERSION:-${{ inputs.image-tag }}}"
+        COMMIT_MSG="chore(${{ inputs.environment }}): update ${{ inputs.service-name }} to ${VERSION}"
+        if [ -n "${{ inputs.build-sha }}" ]; then
+          COMMIT_MSG="$COMMIT_MSG (${{ inputs.build-sha }})"
+        fi
+        git commit -m "$COMMIT_MSG"
+        push_succeeded=false
+        for i in 1 2 3; do
+          if git push; then
+            push_succeeded=true
+            break
+          fi
+          echo "Push failed (attempt $i/3), pulling and retrying..."
+          git pull --rebase
+        done
+        if [ "$push_succeeded" != "true" ]; then
+          echo "::error::Push failed after 3 attempts."
+          exit 1
+        fi
+
+  verify-spa-cache:
+    name: '🔁 Verify ${{ inputs.environment }} cache revalidation'
+    needs: [update-argocd]
+    if: inputs.spa-url != ''
+    runs-on: ubuntu-latest
+    steps:
+      # Why this job exists (US #1019).
+      #
+      # Bugs #975 and #976 were omissions, not regressions: admin-portal and
+      # membership-ui never received the index.html validator fix that
+      # registration-portal got under US #338, and membership-ui carried the
+      # defect for about five months. No unit test in any repository could have
+      # flagged either one, because a repo-local test can only protect code that
+      # is already there. What found it was one HTTP request against a running
+      # pod, which is what this job automates.
+      #
+      # It also covers changes no unit test can see: chart edits, ingress
+      # rewrites, and a CDN being put in front of a host — the last of these
+      # being live, since Cloudflare proxying is expected to be switched on and
+      # a Cloudflare edge strips ETag from non-cacheable HTML.
+
+      - name: Wait for the new version to be serving
+        id: wait
+        run: |
+          set -euo pipefail
+          BASE="${{ inputs.spa-url }}"
+          BASE="${BASE%/}"
+          # The chart version carries a -RELEASE suffix the application does not:
+          # 0.1.5-RELEASE -> 0.1.5, and 0.1.6-SNAPSHOT-RELEASE -> 0.1.6-SNAPSHOT.
+          EXPECTED="${{ inputs.chart-version }}"
+          EXPECTED="${EXPECTED%-RELEASE}"
+
+          if [ -z "$EXPECTED" ]; then
+            echo "::notice::No chart-version supplied; skipping the version wait and checking whatever is live."
+            exit 0
+          fi
+
+          # LIMITATION, deliberate. On dev the version is a -SNAPSHOT that does not
+          # change between builds, so this condition is satisfied by the pod that
+          # is already running and the check may evaluate the previous image. It
+          # still catches the case that matters most — a service that has never
+          # had the fix, which fails regardless of which pod answers — but it
+          # will not catch a regression introduced by that exact dev build. On
+          # stage and prod the version is unique per release, so the gate is
+          # exact. Tightening dev needs a per-build discriminator: build.time, or
+          # git.commit.id, which registration-portal and membership-ui expose but
+          # admin-portal does not.
+          echo "Waiting for $BASE to report build.version=$EXPECTED"
+          # ArgoCD polls its source roughly every 3 minutes, then the rollout
+          # itself takes a while, so this needs to be generous.
+          DEADLINE=$(( SECONDS + 900 ))
+          LAST="(no response)"
+          while [ $SECONDS -lt $DEADLINE ]; do
+            LAST=$(curl -fsS -m 15 "$BASE/management/info" 2>/dev/null | jq -r '.build.version // "absent"' || echo "(unreachable)")
+            if [ "$LAST" = "$EXPECTED" ]; then
+              echo "Live version is $LAST after ${SECONDS}s."
+              exit 0
+            fi
+            echo "  still $LAST, waiting..."
+            sleep 20
+          done
+
+          echo "::error::${{ inputs.service-name }} (${{ inputs.environment }}) never reported build.version=$EXPECTED within 15 minutes. Last seen: $LAST."
+          echo "::error::Either the rollout failed, or the service does not expose build.version — the spring-boot-maven-plugin build-info goal is required for that."
+          exit 1
+
+      - name: Assert index.html does not revalidate to a stale copy
+        run: |
+          set -euo pipefail
+          BASE="${{ inputs.spa-url }}"
+          BASE="${BASE%/}"
+
+          echo "Validators currently served:"
+          curl -fsS -m 20 -D - -o /dev/null "$BASE/index.html" \
+            | grep -iE '^(cache-control|etag|last-modified):' || echo "  (none)"
+
+          # Jib stamps every file in the image with this exact timestamp, so it
+          # is the validator a browser cached from a broken build holds. If the
+          # server still answers 304 to it, every returning browser is being
+          # sent back to the previous release's index.html — and therefore to
+          # the previous release's content-hashed JS bundles.
+          STATUS=$(curl -s -o /dev/null -m 20 -w '%{http_code}' \
+            -H 'If-Modified-Since: Thu, 01 Jan 1970 00:00:01 GMT' \
+            "$BASE/index.html")
+
+          if [ "$STATUS" = "304" ]; then
+            echo "::error::${{ inputs.service-name }} (${{ inputs.environment }}) is serving STALE bundles."
+            echo "::error::A conditional GET carrying Jib's frozen 1970 timestamp answered 304, so returning browsers keep running the previous release until they hard-reload."
+            echo "::error::Fix: port IndexHtmlController + the weak index.html ShallowEtagHeaderFilter, per US #338. Note that having CacheControlFilter is NOT evidence the service is fixed — it sets the policy, not the validator."
+            exit 1
+          fi
+
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Unexpected status $STATUS from $BASE/index.html — expected 200. The check could not be evaluated."
+            exit 1
+          fi
+
+          echo "OK: stale validator correctly rejected (200), so a new release reaches returning browsers."

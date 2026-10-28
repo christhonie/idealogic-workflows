@@ -1,0 +1,148 @@
+name: '🎨 Check Format'
+
+# Fails a pull request whose changes the pre-commit formatting hook would have
+# rewritten.
+#
+# This is the formatting gate for the Angular repositories. Their pre-commit hook
+# runs lint-staged, but a hook is a convenience: it does not run in a git
+# worktree, a fresh clone, or a client without node on PATH, and it is designed to
+# skip rather than block when it cannot run. Nothing downstream checked
+# formatting, so every skipped hook was silent drift. This job is what enforces it.
+#
+# It runs the repository's own lint-staged configuration over the pull request's
+# changes, staged as one commit, and fails if that changes anything. So the rules
+# cannot drift from the hook's: the same glob, the same .prettierignore, the same
+# commands, whatever the repository's lint-staged and Prettier versions. Two
+# deliberate consequences:
+#
+# - Only changed files are checked. A repository with pre-existing drift adopts
+#   this without a mass reformat that would conflict with every open branch.
+# - lint-staged formats whole files, so touching a file with pre-existing drift
+#   means formatting that file - exactly what the hook would have done.
+#
+# Pull requests only - the changes are taken against github.base_ref.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: 'Node version to use. Defaults to 22.'
+        required: false
+        type: string
+        default: '22'
+    secrets:
+      NPM_PASSWORD:
+        required: true
+
+# Account constants. Not inputs yet: one account uses these workflows. To serve a second account,
+# turn each into a workflow_call input with this value as its default.
+env:
+  NPM_SCOPE: '@christhonie'
+
+jobs:
+  check-format:
+    name: '🎨 Format'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # A placeholder, not the secret. The scoped-registry .npmrc written by
+      # setup-node interpolates ${NODE_AUTH_TOKEN} for every npm invocation in the
+      # job - npx, and setup-node's own post-step cache save included - and an
+      # unset variable fails npm at config load (see test-fe.yml). Only the install
+      # needs the registry, so the real token is set on that step alone and is not
+      # in the environment while lint-staged and Prettier plugins run.
+      NODE_AUTH_TOKEN: XXXXX-XXXXX-XXXXX-XXXXX
+      # The install runs the `prepare` script; a CI runner needs no git hooks.
+      HUSKY: 0
+
+    steps:
+    - name: Require a pull request
+      if: ${{ github.event_name != 'pull_request' }}
+      run: |
+        echo "::error::check-format.yml compares against the pull request base and can only run on pull_request events (got '${{ github.event_name }}')."
+        exit 1
+
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        # The base branch must be present locally to find the merge base.
+        fetch-depth: 0
+        # Everything after checkout is local git. Don't leave GITHUB_TOKEN in
+        # .git/config, where dependency install scripts and Prettier plugins
+        # could read it.
+        persist-credentials: false
+
+    - name: Count files changed by this pull request
+      id: changed
+      run: |
+        set -euo pipefail
+        # HEAD is the merge commit GitHub prepares for the pull request. Deleted
+        # files are excluded; there is nothing to format.
+        count=$(git diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}...HEAD" | wc -l)
+        echo "Changed files: $count"
+        echo "count=$count" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Node
+      if: ${{ steps.changed.outputs.count != '0' }}
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node-version }}
+        registry-url: https://npm.pkg.github.com
+        scope: ${{ env.NPM_SCOPE }}
+        cache: 'npm'
+
+    - name: Cache npm dependencies
+      if: ${{ steps.changed.outputs.count != '0' }}
+      uses: actions/cache@v6
+      with:
+        path: '**/node_modules'
+        # Same key as test-fe.yml, so the two jobs share one cache entry.
+        key: ${{ runner.os }}-node${{ inputs.node-version }}-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node${{ inputs.node-version }}-
+
+    - name: Install npm packages
+      if: ${{ steps.changed.outputs.count != '0' }}
+      # Install scripts still see the token; they are not disabled with
+      # --ignore-scripts because this job shares test-fe.yml's node_modules cache,
+      # and a script-less install saved there would break test-fe.
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_PASSWORD }}
+      run: |
+        npm install
+        # `npm install` may rewrite tracked files such as package-lock.json.
+        # Discard that, or it would be mistaken for a formatting change below.
+        git checkout -- .
+
+    - name: Run the pre-commit formatting over this pull request's changes
+      if: ${{ steps.changed.outputs.count != '0' }}
+      run: |
+        set -euo pipefail
+        # Stage everything the pull request changes, as a single commit would.
+        git reset --quiet --soft "$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
+        before=$(git write-tree)
+
+        # --no-stash: there is nothing to protect on a runner, and lint-staged
+        # then applies its changes straight to the index and working tree.
+        # `|| rc=$?` because the step shell runs with -e.
+        rc=0
+        npx --no-install lint-staged --no-stash || rc=$?
+        if [ "$rc" -ne 0 ]; then
+          echo "::error title=Formatting::lint-staged failed (exit $rc). See the task output above."
+          exit "$rc"
+        fi
+
+        after=$(git write-tree)
+        changed=$( { git diff --name-only "$before" "$after"; git diff --name-only; } | sort -u)
+        if [ -n "$changed" ]; then
+          echo "The pre-commit hook would have rewritten:"
+          echo "$changed"
+          echo
+          git --no-pager diff "$before" "$after"
+          git --no-pager diff
+          echo "::error title=Formatting::Files in this pull request are not formatted. Run 'npx prettier --write' on the files listed above, or commit from a checkout where the pre-commit hook runs."
+          exit 1
+        fi
+
+        echo "Nothing to reformat."

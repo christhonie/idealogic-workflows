@@ -1,0 +1,478 @@
+name: '⏩ Gitflow Release Finish'
+# This flow should only be called AFTER a release/* or hotfix/* branch has been merged into main.
+# It will not perform any tests - This should be done separately in other actions.
+# The job auto-detects which kind of branch is in flight and dispatches to the
+# matching gitflow goal (release-finish or hotfix-finish).
+
+on:
+  workflow_call:
+    inputs:
+      jdk-version:
+        description: 'JDK version to use. Defaults to 17.'
+        required: false
+        type: string
+        default: '17'
+    secrets:
+      # A personal access token with write access to this repository, used for the
+      # back-merge push to develop.
+      #
+      # The default GITHUB_TOKEN pushes as github-actions[bot]. Where develop carries a
+      # required status check - the "PR checks" aggregator introduced by US #1023 - that push
+      # is rejected with GH006, because a bot is not an administrator and so is not covered by
+      # `enforce_admins: false`. The release has already been built, tested and merged to main
+      # by the time this job runs; the gate exists for human pushes, not for the automated
+      # back-merge that closes the release out.
+      #
+      # Named to match the existing convention in ems-payment-stub, which uses RELEASE_PAT for
+      # the same purpose: an admin PAT (Contents: read+write) that is a bypass actor for the
+      # branch rule blocking an automated push.
+      #
+      # Optional. When unset this falls back to GITHUB_TOKEN, so repositories whose develop
+      # carries no required check keep working with no change.
+      RELEASE_PAT:
+        required: false
+
+jobs:
+  release-finish:
+    name: '⏩ Release Finish'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+    - run: echo "Job triggered by a ${{ github.event_name }} event."
+
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        ref: main
+        # Persisted for every later push in this job, the back-merge to develop included.
+        token: ${{ secrets.RELEASE_PAT || github.token }}
+
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: ${{ inputs.jdk-version }}
+        distribution: 'temurin'
+
+    # Cache Maven dependencies. Stable deps are reused via restore-keys fallback.
+    # SNAPSHOTs may be served stale — workflows that need fresh SNAPSHOTs
+    # (test-be.yml, maven-package.yml) explicitly purge them and run Maven with -U.
+    - name: Cache Maven dependencies
+      uses: actions/cache@v6
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-
+          ${{ runner.os }}-maven-
+
+    - name: Setup git for commits
+      run: |
+        git config user.name "GitHub Action"
+        git config user.email "noreply@github.com"
+
+    # Triggered by every push to main, but a finish only makes sense when an in-flight
+    # release/* or hotfix/* branch exists. Detect once and gate the rest of the job.
+    # The "exactly one in-flight branch" rule applies across the union: a release and
+    # a hotfix open at the same time can't both be safely finished from one main commit.
+    - name: Detect active release or hotfix branch
+      id: detect
+      run: |
+        RELEASE_BRANCHES=$(git branch -r --list 'origin/release/*' | sed 's|origin/||' | xargs)
+        HOTFIX_BRANCHES=$(git branch -r --list 'origin/hotfix/*' | sed 's|origin/||' | xargs)
+        BRANCHES=$(echo "$RELEASE_BRANCHES $HOTFIX_BRANCHES" | xargs)
+        COUNT=$(echo "$BRANCHES" | wc -w)
+        RELEASE_COUNT=$(echo "$RELEASE_BRANCHES" | wc -w)
+        HOTFIX_COUNT=$(echo "$HOTFIX_BRANCHES" | wc -w)
+
+        if [ "$RELEASE_COUNT" -gt 0 ] && [ "$HOTFIX_COUNT" -gt 0 ]; then
+          KIND='mixed'
+        elif [ "$RELEASE_COUNT" -gt 0 ]; then
+          KIND='release'
+        elif [ "$HOTFIX_COUNT" -gt 0 ]; then
+          KIND='hotfix'
+        else
+          KIND='none'
+        fi
+
+        echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "branches=$BRANCHES" >> "$GITHUB_OUTPUT"
+        echo "kind=$KIND" >> "$GITHUB_OUTPUT"
+
+        if [ "$COUNT" = "0" ]; then
+          echo "No release/hotfix branch in flight — finish step will be skipped."
+        else
+          echo "Found $COUNT branch(es) [kind=$KIND]: $BRANCHES"
+        fi
+
+    - name: Sync local branches with remote
+      if: steps.detect.outputs.count != '0'
+      run: |
+        git checkout main
+        git pull origin main
+        git checkout develop || git checkout -b develop origin/develop
+        git pull origin develop
+
+    # After a release/hotfix PR merges, the active branch is itself an ancestor of
+    # main, so we can't auto-distinguish active from stale by ancestry. Fail fast and
+    # require human cleanup when more than one in-flight branch exists, OR when both
+    # a release and a hotfix are open simultaneously (gitflow can't safely finish both
+    # from one main commit).
+    - name: Validate single in-flight branch
+      if: steps.detect.outputs.count != '0'
+      run: |
+        if [ "${{ steps.detect.outputs.kind }}" = "mixed" ]; then
+          echo "::error::Both release/* and hotfix/* branches found: ${{ steps.detect.outputs.branches }}"
+          echo "Refusing to continue — cannot safely finish both from one main commit."
+          echo "Please finish or delete one of them before re-running."
+          exit 1
+        fi
+        if [ "${{ steps.detect.outputs.count }}" -gt 1 ]; then
+          echo "::error::Multiple ${{ steps.detect.outputs.kind }} branches found: ${{ steps.detect.outputs.branches }}"
+          echo "Refusing to continue — cannot safely distinguish active from stale."
+          echo "Please delete extra branches before re-running."
+          exit 1
+        fi
+
+    # -DskipReleaseMergeDevBranch=true takes the develop back-merge away from the plugin;
+    # the "Back-merge release into develop" step below owns it. The plugin has no conflict
+    # resolution, and it merges the tag — whose pom.xml carries the release <revision> —
+    # into develop, which has moved on. Any branch that merges to develop while a release
+    # is open collides on exactly that line, because reserving the next SNAPSHOT on a
+    # branch is the documented convention here. The goal then aborts, leaving main
+    # untagged, develop neither back-merged nor bumped, and the release branch undeleted —
+    # while the artefact has already shipped from the jobs running ahead of this one.
+    # Structural, not incidental. Same shape as the hotfix case below.
+    #
+    # With the develop merge skipped the plugin will not bump develop's version either,
+    # so the step below owns both the merge and the bump.
+    - name: Maven Gitflow Release Finish
+      if: steps.detect.outputs.kind == 'release'
+      run: mvn gitflow:release-finish --batch-mode --no-transfer-progress -DskipTestProject=true -DinstallProject=false -DskipReleaseMergeDevBranch=true
+
+    # The develop half of release-finish, done explicitly so the pom.xml conflict described
+    # above can be resolved instead of aborting the job. Deliberately narrow: only the root
+    # pom.xml is auto-resolved, and only when it is the sole conflicted path — a release that
+    # genuinely conflicts with develop still needs a human.
+    #
+    # pom.xml is the only version file that can conflict, including on the Node repos: they
+    # drive their release through this same Maven plugin, and their package.json carries a
+    # static 0.0.1-SNAPSHOT that release-start never touches.
+    - name: Back-merge release into develop
+      if: steps.detect.outputs.kind == 'release'
+      env:
+        RELEASE_BRANCH: ${{ steps.detect.outputs.branches }}
+      run: |
+        set -euo pipefail
+
+        VERSION="${RELEASE_BRANCH#release/}"
+        DEV_BRANCH=develop
+
+        read_revision() {
+          sed -n 's:.*<revision>\([^<]*\)</revision>.*:\1:p; /<revision>/q' pom.xml
+        }
+
+        # The next-development-version arithmetic below only makes sense for a plain X.Y.Z
+        # release version. Anything else (qualifiers, support-branch releases) needs a human —
+        # fail before touching develop rather than guessing.
+        if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::Cannot derive the next development version from release version '$VERSION' (expected X.Y.Z). Back-merge into $DEV_BRANCH by hand."
+          exit 1
+        fi
+
+        if ! git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+          echo "::error::Tag '$VERSION' not found. gitflow:release-finish should have created it — refusing to back-merge."
+          exit 1
+        fi
+
+        # Push the tag before develop, so a develop build triggered by the develop push can
+        # resolve anything pinned to the release version. Usually a no-op: the plugin already
+        # pushed it alongside main via --follow-tags.
+        git push origin "refs/tags/$VERSION"
+
+        git checkout "$DEV_BRANCH"
+        git pull --ff-only origin "$DEV_BRANCH"
+
+        DEV_REVISION="$(read_revision)"
+        if [ -z "$DEV_REVISION" ]; then
+          echo "::error::No <revision> property found in $DEV_BRANCH's pom.xml."
+          exit 1
+        fi
+        echo "$DEV_BRANCH is on <revision>$DEV_REVISION; finishing release $VERSION."
+
+        # Merge the tag, not the branch — matches the history the plugin produces
+        # ("Merge tag 'X.Y.Z' into develop") and survives the plugin having already
+        # deleted the release branch.
+        if git merge --no-ff --no-edit "$VERSION"; then
+          echo "Back-merge of $VERSION into $DEV_BRANCH merged cleanly."
+        else
+          CONFLICTS="$(git diff --name-only --diff-filter=U)"
+
+          # Anything other than the root pom is a genuine code conflict and needs a human.
+          # Abort, leaving develop exactly as it was.
+          if [ "$CONFLICTS" != "pom.xml" ]; then
+            echo "::error::Unexpected conflicts back-merging $VERSION into $DEV_BRANCH, hand-merge required: $(echo "$CONFLICTS" | tr '\n' ' ')"
+            git merge --abort
+            exit 1
+          fi
+
+          TMP="$(mktemp -d)"
+          if ! { git show :1:pom.xml > "$TMP/base.xml" \
+              && git show :2:pom.xml > "$TMP/ours.xml" \
+              && git show :3:pom.xml > "$TMP/theirs.xml"; }; then
+            echo "::error::Could not read the conflicted pom.xml stages — hand-merge required."
+            rm -rf "$TMP"
+            git merge --abort
+            exit 1
+          fi
+
+          # Establish that taking develop's side is LOSSLESS before doing it.
+          #
+          # Resolution below keeps develop's side of every conflicting hunk. That is only
+          # safe if <revision> is the sole thing the release changed: git conflict hunks are
+          # line-range based, and <revision> usually sits adjacent to other properties, so a
+          # release that also touched one of those would have both collapsed into a single
+          # hunk — and develop's side would silently drop the other change. Verified: with
+          # <revision> and a dependency property on adjacent lines, the dependency bump is
+          # lost without this guard.
+          #
+          # So compare the merge base with the release's side and require every changed line
+          # to be the <revision> line. Anything more is real divergence for a human, which is
+          # the same principle as the non-pom conflict check above.
+          RELEASE_POM_CHANGES="$(git diff --no-index --unified=0 "$TMP/base.xml" "$TMP/theirs.xml" 2>/dev/null \
+            | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | grep -vE '<revision>' || true)"
+          if [ -n "$RELEASE_POM_CHANGES" ]; then
+            echo "::error::The release changed pom.xml beyond <revision>; auto-resolving would drop those edits. Hand-merge required."
+            echo "$RELEASE_POM_CHANGES"
+            rm -rf "$TMP"
+            git merge --abort
+            exit 1
+          fi
+
+          # Resolve the conflicting hunks in favour of develop, the leading edge for
+          # <revision> and the shared dependency properties. Proven lossless by the guard
+          # above. `git checkout --ours pom.xml` is not equivalent — it would take develop's
+          # whole file, discarding release edits in hunks that merged cleanly.
+          if ! git merge-file --ours "$TMP/ours.xml" "$TMP/base.xml" "$TMP/theirs.xml"; then
+            echo "::error::Could not auto-resolve the pom.xml conflict — hand-merge required."
+            rm -rf "$TMP"
+            git merge --abort
+            exit 1
+          fi
+          cp "$TMP/ours.xml" pom.xml
+          rm -rf "$TMP"
+
+          if grep -qE '^(<<<<<<<|=======|>>>>>>>)' pom.xml; then
+            echo "::error::Conflict markers remain in pom.xml after auto-resolution — hand-merge required."
+            git merge --abort
+            exit 1
+          fi
+
+          git add pom.xml
+          # core.editor=true suppresses the editor for the merge commit message, keeping
+          # git's default "Merge tag 'X.Y.Z' into develop".
+          git -c core.editor=true merge --continue
+          echo "Auto-resolved the pom.xml conflict in favour of $DEV_BRANCH."
+        fi
+
+        # Bump develop to the next development version, never backwards. The plugin derives
+        # it from the release version alone; if develop has already moved to a higher version
+        # while a lower release was in flight, release-patch + 1 would be a regression.
+        NEXT_FROM_RELEASE="${VERSION%.*}.$(( ${VERSION##*.} + 1 ))"
+        DEV_BASE="${DEV_REVISION%-SNAPSHOT}"
+        NEXT="$(printf '%s\n%s\n' "$DEV_BASE" "$NEXT_FROM_RELEASE" | sort -V | tail -1)-SNAPSHOT"
+
+        # <revision> and not <version>: the gitflow config in parent-pom sets
+        # versionProperty=revision with skipUpdateVersion=true, so every EMS project carries
+        # its version in <revision> and <version> is ${revision}.
+        CURRENT="$(read_revision)"
+        if [ "$CURRENT" = "$NEXT" ]; then
+          echo "$DEV_BRANCH is already on <revision>$NEXT — no version bump needed."
+        else
+          echo "Setting $DEV_BRANCH <revision> to $NEXT (was $CURRENT)."
+          sed -i "0,/<revision>[^<]*<\/revision>/s//<revision>$NEXT<\/revision>/" pom.xml
+          # Message must match parent-pom's <releaseFinishMessage> template verbatim —
+          # note "incremented", where hotfix-finish says "updated".
+          git commit -am "Release now finished. Development version incremented to $NEXT."
+        fi
+
+        git push origin "$DEV_BRANCH"
+
+    # hotfix-finish requires the hotfix branch to exist LOCALLY. Unlike
+    # release-finish, it does not auto-discover or fetch it. The sync step above
+    # only checks out main and develop, so create a local ref tracking the remote
+    # hotfix branch here. Without this the plugin fails at branch verification with
+    # "Hotfix branch with name 'hotfix/X.Y.Z' doesn't exist. Cannot finish hotfix."
+    - name: Create local hotfix branch for finish
+      if: steps.detect.outputs.kind == 'hotfix'
+      run: git branch --force "${{ steps.detect.outputs.branches }}" "origin/${{ steps.detect.outputs.branches }}"
+
+    # Unlike release-finish, hotfix-finish has no auto-discovery in non-interactive mode —
+    # it requires the branch to be passed explicitly via -DhotfixBranch (full branch name
+    # including prefix). We pass the value detected above.
+    #
+    # -DskipMergeDevBranch=true takes the develop back-merge away from the plugin; the
+    # "Back-merge hotfix into develop" step below owns it. The plugin has no conflict
+    # resolution, and a hotfix branch is cut from main, so its pom.xml carries main's
+    # <revision> and pinned dependency versions while develop has moved on. Those
+    # properties sit on adjacent lines, which collapses them into one conflict hunk that
+    # git cannot auto-merge. The goal then aborts, leaving main untagged, develop neither
+    # back-merged nor bumped, and the hotfix branch undeleted — while the artefact has
+    # already shipped from the jobs running ahead of this one. Structural, not incidental:
+    # it fires on any hotfix where develop has advanced a pinned version past main.
+    # release-finish is unaffected because release branches are cut from develop.
+    # See ADO Bug #1007.
+    #
+    # With the develop merge skipped the plugin will not bump develop's version either,
+    # so the step below owns both the merge and the bump.
+    - name: Maven Gitflow Hotfix Finish
+      if: steps.detect.outputs.kind == 'hotfix'
+      run: mvn gitflow:hotfix-finish --batch-mode --no-transfer-progress -DskipTestProject=true -DinstallProject=false -DskipMergeDevBranch=true -DhotfixBranch='${{ steps.detect.outputs.branches }}'
+
+    # The develop half of hotfix-finish, done explicitly so the pom.xml conflict described
+    # above can be resolved instead of aborting the job. Deliberately narrow: only the root
+    # pom.xml is auto-resolved, and only when it is the sole conflicted path — a hotfix that
+    # genuinely conflicts with develop still needs a human.
+    - name: Back-merge hotfix into develop
+      if: steps.detect.outputs.kind == 'hotfix'
+      env:
+        HOTFIX_BRANCH: ${{ steps.detect.outputs.branches }}
+      run: |
+        set -euo pipefail
+
+        VERSION="${HOTFIX_BRANCH#hotfix/}"
+        DEV_BRANCH=develop
+
+        read_revision() {
+          sed -n 's:.*<revision>\([^<]*\)</revision>.*:\1:p; /<revision>/q' pom.xml
+        }
+
+        # The next-development-version arithmetic below only makes sense for a plain X.Y.Z
+        # hotfix version. Anything else (qualifiers, support-branch hotfixes) needs a human —
+        # fail before touching develop rather than guessing.
+        if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::Cannot derive the next development version from hotfix version '$VERSION' (expected X.Y.Z). Back-merge into $DEV_BRANCH by hand."
+          exit 1
+        fi
+
+        if ! git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+          echo "::error::Tag '$VERSION' not found. gitflow:hotfix-finish should have created it — refusing to back-merge."
+          exit 1
+        fi
+
+        # Push the tag before develop, so a develop build triggered by the develop push can
+        # resolve anything pinned to the hotfix version. Usually a no-op: the plugin already
+        # pushed it alongside main via --follow-tags.
+        git push origin "refs/tags/$VERSION"
+
+        git checkout "$DEV_BRANCH"
+        git pull --ff-only origin "$DEV_BRANCH"
+
+        DEV_REVISION="$(read_revision)"
+        if [ -z "$DEV_REVISION" ]; then
+          echo "::error::No <revision> property found in $DEV_BRANCH's pom.xml."
+          exit 1
+        fi
+        echo "$DEV_BRANCH is on <revision>$DEV_REVISION; finishing hotfix $VERSION."
+
+        # Merge the tag, not the branch — matches the history the plugin produces
+        # ("Merge tag 'X.Y.Z' into develop") and survives the plugin having already
+        # deleted the hotfix branch.
+        if git merge --no-ff --no-edit "$VERSION"; then
+          echo "Back-merge of $VERSION into $DEV_BRANCH merged cleanly."
+        else
+          CONFLICTS="$(git diff --name-only --diff-filter=U)"
+
+          # Anything other than the root pom is a genuine code conflict and needs a human.
+          # Abort, leaving develop exactly as it was.
+          if [ "$CONFLICTS" != "pom.xml" ]; then
+            echo "::error::Unexpected conflicts back-merging $VERSION into $DEV_BRANCH, hand-merge required: $(echo "$CONFLICTS" | tr '\n' ' ')"
+            git merge --abort
+            exit 1
+          fi
+
+          TMP="$(mktemp -d)"
+          if ! { git show :1:pom.xml > "$TMP/base.xml" \
+              && git show :2:pom.xml > "$TMP/ours.xml" \
+              && git show :3:pom.xml > "$TMP/theirs.xml"; }; then
+            echo "::error::Could not read the conflicted pom.xml stages — hand-merge required."
+            rm -rf "$TMP"
+            git merge --abort
+            exit 1
+          fi
+
+          # Establish that taking develop's side is LOSSLESS before doing it.
+          #
+          # Resolution below keeps develop's side of every conflicting hunk. That is only
+          # safe if <revision> is the sole thing the hotfix changed: git conflict hunks are
+          # line-range based, and <revision> usually sits adjacent to other properties, so a
+          # hotfix that also touched one of those would have both collapsed into a single
+          # hunk — and develop's side would silently drop the other change. That is the more
+          # likely shape here than on the release path: a hotfix exists precisely to carry a
+          # substantive change, and bumping a dependency property next to <revision> is a
+          # routine way to make one.
+          #
+          # So compare the merge base with the hotfix's side and require every changed line
+          # to be the <revision> line. Anything more is real divergence for a human, which is
+          # the same principle as the non-pom conflict check above.
+          HOTFIX_POM_CHANGES="$(git diff --no-index --unified=0 "$TMP/base.xml" "$TMP/theirs.xml" 2>/dev/null \
+            | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | grep -vE '<revision>' || true)"
+          if [ -n "$HOTFIX_POM_CHANGES" ]; then
+            echo "::error::The hotfix changed pom.xml beyond <revision>; auto-resolving would drop those edits. Hand-merge required."
+            echo "$HOTFIX_POM_CHANGES"
+            rm -rf "$TMP"
+            git merge --abort
+            exit 1
+          fi
+
+          # Resolve the conflicting hunks in favour of develop, which is the leading edge for
+          # <revision> and the shared dependency properties — but keep every non-conflicting
+          # change the hotfix made to the pom. Proven lossless by the guard above.
+          # `git checkout --ours pom.xml` would take develop's whole file and silently drop those.
+          if ! git merge-file --ours "$TMP/ours.xml" "$TMP/base.xml" "$TMP/theirs.xml"; then
+            echo "::error::Could not auto-resolve the pom.xml conflict — hand-merge required."
+            rm -rf "$TMP"
+            git merge --abort
+            exit 1
+          fi
+          cp "$TMP/ours.xml" pom.xml
+          rm -rf "$TMP"
+
+          if grep -qE '^(<<<<<<<|=======|>>>>>>>)' pom.xml; then
+            echo "::error::Conflict markers remain in pom.xml after auto-resolution — hand-merge required."
+            git merge --abort
+            exit 1
+          fi
+
+          git add pom.xml
+          # core.editor=true suppresses the editor for the merge commit message, keeping
+          # git's default "Merge tag 'X.Y.Z' into develop".
+          git -c core.editor=true merge --continue
+          echo "Auto-resolved the pom.xml conflict in favour of $DEV_BRANCH."
+        fi
+
+        # Bump develop to the next development version, never backwards. The plugin derives
+        # it from the hotfix version alone; if develop has already moved to a higher version
+        # while a lower hotfix was in flight, hotfix-patch + 1 would be a regression.
+        NEXT_FROM_HOTFIX="${VERSION%.*}.$(( ${VERSION##*.} + 1 ))"
+        DEV_BASE="${DEV_REVISION%-SNAPSHOT}"
+        NEXT="$(printf '%s\n%s\n' "$DEV_BASE" "$NEXT_FROM_HOTFIX" | sort -V | tail -1)-SNAPSHOT"
+
+        # <revision> and not <version>: the gitflow config in parent-pom sets
+        # versionProperty=revision with skipUpdateVersion=true, so every EMS project carries
+        # its version in <revision> and <version> is ${revision}.
+        CURRENT="$(read_revision)"
+        if [ "$CURRENT" = "$NEXT" ]; then
+          echo "$DEV_BRANCH is already on <revision>$NEXT — no version bump needed."
+        else
+          echo "Setting $DEV_BRANCH <revision> to $NEXT (was $CURRENT)."
+          sed -i "0,/<revision>[^<]*<\/revision>/s//<revision>$NEXT<\/revision>/" pom.xml
+          # Message must match parent-pom's <hotfixFinishMessage> template verbatim —
+          # note "updated", where release-finish says "incremented".
+          git commit -am "Hotfix now finished. Development version updated to $NEXT."
+        fi
+
+        git push origin "$DEV_BRANCH"

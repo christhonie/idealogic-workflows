@@ -1,0 +1,97 @@
+name: '✅ Test Front-end'
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: 'Node version to use. Defaults to 22.'
+        required: false
+        type: string
+        default: '22'
+      run-tests:
+        description: >
+          Whether to actually run `npm run ci:frontend:test`.
+
+          Defaults to false, which preserves the behaviour of the hard-coded
+          always-false conditional this replaces. Consumers opt in once their
+          suite is green; the default flips to true when the last one has.
+
+          When false the job still installs and builds, and emits a workflow
+          warning so a green check is not mistaken for evidence that tests
+          passed.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      NPM_PASSWORD:
+        required: true
+
+# Account constants. Not inputs yet: one account uses these workflows. To serve a second account,
+# turn each into a workflow_call input with this value as its default.
+env:
+  NPM_SCOPE: '@christhonie'
+
+jobs:
+  test-fe:
+    name: '✅ Test'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      JHI_DISABLE_WEBPACK_LOGS: true
+      NG_CLI_ANALYTICS: false
+      # setup-node@v7 no longer exports a placeholder NODE_AUTH_TOKEN, and the
+      # .npmrc it writes for the scoped registry interpolates ${NODE_AUTH_TOKEN}
+      # for the lifetime of the job — not just for the install step. Declared at
+      # job level so every npm invocation resolves it; scoping it to `npm install`
+      # alone left `npm run ci:frontend:test` able to trip on an unresolvable
+      # reference at config-load time, before any registry request is made.
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_PASSWORD }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Set up Node
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node-version }}
+        registry-url: https://npm.pkg.github.com
+        scope: ${{ env.NPM_SCOPE }}
+        cache: 'npm'
+
+    - name: Cache npm dependencies
+      uses: actions/cache@v6
+      with:
+        path: '**/node_modules'
+        key: ${{ runner.os }}-node${{ inputs.node-version }}-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node${{ inputs.node-version }}-
+
+    - name: Install npm packages
+      # In dev, run 'npm install'. In prod, run 'npm ci'.
+      # NODE_AUTH_TOKEN now comes from the job-level env above.
+      run: npm install
+
+    - name: Run Front-end test
+      run: npm run ci:frontend:test
+      if: ${{ inputs.run-tests }}
+
+    # Without this, a repository that has not opted in shows the same green
+    # check as one whose suite actually ran — which is how the original
+    # blanket skip went unnoticed. The warning makes the gap legible in the
+    # run summary and on the PR.
+    - name: Front-end tests were skipped
+      if: ${{ !inputs.run-tests }}
+      run: |
+        echo "::warning title=Front-end tests skipped::This repository has not opted in to the front-end test gate (run-tests: false). A green check here means the build succeeded, NOT that tests passed."
+
+    - name: Save Webpack Bundle Analyzer output
+      uses: actions/upload-artifact@v7
+      with:
+        name: WebpackBundleAnalyzer
+        path: target/classes/stats.html
+        retention-days: 14
+        # Not every consumer runs the bundle analyzer; a missing file should
+        # not fail an otherwise good run.
+        if-no-files-found: ignore

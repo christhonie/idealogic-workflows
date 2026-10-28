@@ -1,0 +1,157 @@
+name: '⎈ Helm Package and Push'
+
+on:
+  workflow_call:
+    inputs:
+      maven-profiles:
+        description: 'Profile to activate during packaging. Defaults to dev.'
+        required: false
+        type: string
+        default: 'dev'
+      jdk-version:
+        description: 'JDK version to use. Defaults to 17.'
+        required: false
+        type: string
+        default: '17'
+    secrets:
+      DOCKER_PAT:
+        required: true
+      # helm:package resolves the project (and therefore the parent POM) from
+      # GitHub Packages. This workflow never had Maven credentials at all, so it
+      # depends entirely on a warm ~/.m2 cache. Optional, for the same
+      # backwards-compatibility reason as docker-build.yml.
+      MAVEN_PASSWORD:
+        required: false
+    outputs:
+      chart-version:
+        description: 'The Helm chart version that was packaged and pushed'
+        value: ${{ jobs.helm-build.outputs.chart-version }}
+
+# Account constants. Not inputs yet: one account uses these workflows. To serve a second account,
+# turn each into a workflow_call input with this value as its default.
+env:
+  MAVEN_SERVER_ID: github-christhonie    # distributionManagement/repository/id in the parent POM
+  MAVEN_USERNAME: christhonie
+  DOCKER_HUB_USER: christhonie
+  DOCKER_SERVER_ID: dockerhub-christhonie    # the Docker Hub <server> id the helm-maven-plugin reads
+
+jobs:
+  helm-build:
+    name: '☸ Package and Push'
+    runs-on: ubuntu-latest
+    outputs:
+      chart-version: ${{ steps.chart-version.outputs.version }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    # setup-java can only generate a single <server> entry, and this job needs two:
+    # dockerhub-christhonie for helm:push, and github-christhonie to resolve the
+    # project and its parent POM from GitHub Packages. Authoring the file here is
+    # why the server-id/settings-path inputs are absent — see 'Create Maven settings'.
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: ${{ inputs.jdk-version }}
+        distribution: 'temurin'
+
+    # Cache Maven dependencies. Stable deps are reused via restore-keys fallback.
+    # SNAPSHOTs may be served stale — workflows that need fresh SNAPSHOTs
+    # (test-be.yml, maven-package.yml) explicitly purge them and run Maven with -U.
+    - name: Cache Maven dependencies
+      uses: actions/cache@v6
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-
+          ${{ runner.os }}-maven-
+
+    - name: Recover cached target dir
+      id: target-restore
+      uses: actions/cache/restore@v6
+      with:
+        path: target
+        key: ${{ runner.os }}-jdk${{ inputs.jdk-version }}-target-${{ github.run_id }}
+
+    # Two servers, one file. The ${env.*} placeholders are the same form setup-java
+    # emits, so helm:push resolves dockerhub-christhonie exactly as before; the
+    # github-christhonie entry is what actually makes MAVEN_USERNAME/MAVEN_PASSWORD
+    # take effect. Without it those env vars are inert and Maven falls back to
+    # anonymous access, which 401s against GitHub Packages on a cold cache.
+    - name: Create Maven settings
+      run: |
+        mkdir -p /home/runner/.m2/docker
+        cat > /home/runner/.m2/docker/settings.xml <<'XML'
+        <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+          <servers>
+            <server>
+              <id>${{ env.MAVEN_SERVER_ID }}</id>
+              <username>${env.MAVEN_USERNAME}</username>
+              <password>${env.MAVEN_PASSWORD}</password>
+            </server>
+            <server>
+              <id>${{ env.DOCKER_SERVER_ID }}</id>
+              <username>${env.DOCKER_USERNAME}</username>
+              <password>${env.DOCKER_TOKEN}</password>
+            </server>
+          </servers>
+        </settings>
+        XML
+
+    # helm-maven-plugin 6.17.0 requires settings-security.xml for password decryption
+    # during helm:push, but setup-java doesn't create one. The docker/settings.xml
+    # uses plaintext passwords, so the master password is not used for decryption.
+    # Provide a dummy value to satisfy the Plexus cipher initialisation.
+    - name: Create settings-security.xml
+      run: echo '<settingsSecurity><master>placeholder</master></settingsSecurity>' > /home/runner/.m2/settings-security.xml
+
+    # -s is required here too: this resolves the project model (and therefore the
+    # parent POM) from GitHub Packages, and the credentials live in that file.
+    - name: Extract chart version
+      id: chart-version
+      run: |
+        VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout \
+          -s /home/runner/.m2/docker/settings.xml)
+        echo "version=${VERSION}-RELEASE" >> "$GITHUB_OUTPUT"
+        echo "Chart version will be: ${VERSION}-RELEASE"
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+
+    # Use Helm CLI for registry login instead of helm:registry-login Maven goal.
+    # The Maven goal stores credentials under registry-1.docker.io/christhonie
+    # instead of registry-1.docker.io, causing 401 errors on push.
+    - name: Login to Docker Hub Registry
+      run: echo "${{ secrets.DOCKER_PAT }}" | helm registry login registry-1.docker.io -u ${{ env.DOCKER_HUB_USER }} --password-stdin
+
+    # Replaces blanket `continue-on-error: true`, which was previously used to tolerate
+    # "tag already exists" errors on SNAPSHOT re-pushes (commit 22bbd8a) but also masked
+    # genuine failures while still exporting the chart-version output. We now fail
+    # loudly on real errors and only swallow the duplicate-tag case.
+    - name: Package and Push Helm Chart
+      shell: bash
+      run: |
+        set +e
+        OUTPUT_FILE=$(mktemp)
+        trap 'rm -f "$OUTPUT_FILE"' EXIT
+        mvn helm:init helm:package helm:push --batch-mode --no-transfer-progress \
+            ${MAVEN_PROFILES:+-P"$MAVEN_PROFILES"} -s /home/runner/.m2/docker/settings.xml 2>&1 \
+          | tee "$OUTPUT_FILE"
+        EXIT_CODE=${PIPESTATUS[0]}
+        if [ $EXIT_CODE -eq 0 ]; then
+          exit 0
+        fi
+        if grep -qiE 'already exists|409 Conflict|tag.*exists' "$OUTPUT_FILE"; then
+          echo "::warning::Helm chart tag already exists — likely SNAPSHOT re-push, continuing"
+          exit 0
+        fi
+        echo "::error::Helm push failed (exit $EXIT_CODE)"
+        exit $EXIT_CODE
+      env:
+        DOCKER_USERNAME: ${{ env.DOCKER_HUB_USER }}
+        DOCKER_TOKEN: ${{ secrets.DOCKER_PAT }}
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+        MAVEN_PROFILES: ${{ inputs.maven-profiles }}

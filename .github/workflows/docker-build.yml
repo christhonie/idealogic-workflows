@@ -1,0 +1,122 @@
+name: '🐋 Docker Build and Publish'
+
+on:
+  workflow_call:
+    inputs:
+      maven-profiles:
+        description: 'Profile to activate during packaging. Defaults to dev.'
+        required: false
+        type: string
+        default: 'dev'
+      jdk-version:
+        description: 'JDK version to use. Defaults to 17.'
+        required: false
+        type: string
+        default: '17'
+    secrets:
+      DOCKER_PAT:
+        required: true
+      # The 'Build and Publish' step has always referenced secrets.MAVEN_PASSWORD,
+      # but it was never declared here — an undeclared secret resolves to the empty
+      # string in a reusable workflow, so jib:build has been running without
+      # GitHub Packages credentials. It only works because the restored ~/.m2 cache
+      # already holds the dependencies; a cache miss makes the build 401.
+      # Optional so that callers which do not pass it keep working unchanged.
+      MAVEN_PASSWORD:
+        required: false
+    outputs:
+      image-tag:
+        description: 'The Docker image tag that was built and pushed'
+        value: ${{ jobs.docker-build.outputs.image-tag }}
+
+# Account constants. Not inputs yet: one account uses these workflows. To serve a second account,
+# turn each into a workflow_call input with this value as its default.
+env:
+  MAVEN_SERVER_ID: github-christhonie    # distributionManagement/repository/id in the parent POM
+  MAVEN_USERNAME: christhonie
+  DOCKER_HUB_USER: christhonie
+
+jobs:
+  docker-build:
+    name: '🐋 Build and Publish'
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.get-version.outputs.version }}
+
+    steps:
+    - name: Login to Docker Hub
+      uses: docker/login-action@v4
+      with:
+        username: ${{ env.DOCKER_HUB_USER }}
+        password: ${{ secrets.DOCKER_PAT }}
+
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: ${{ inputs.jdk-version }}
+        distribution: 'temurin'
+        server-id: ${{ env.MAVEN_SERVER_ID }} # Value of the distributionManagement/repository/id field of the pom.xml
+        server-username: MAVEN_USERNAME # env variable for username in deploy
+        server-password: MAVEN_PASSWORD # env variable for token in deploy
+
+    # Cache Maven dependencies. Stable deps are reused via restore-keys fallback.
+    # SNAPSHOTs may be served stale — workflows that need fresh SNAPSHOTs
+    # (test-be.yml, maven-package.yml) explicitly purge them and run Maven with -U.
+    - name: Cache Maven dependencies
+      uses: actions/cache@v6
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-
+          ${{ runner.os }}-maven-
+
+    # Mandatory, not best-effort. This job containerises artefacts the `package` job already
+    # built - target/classes and anything a package-phase execution produced there, the
+    # OpenTelemetry javaagent among them. Every caller declares `docker-build needs: [package]`
+    # with a matching jdk-version, so within a run this key always exists.
+    #
+    # On a miss the previous behaviour was to carry on and let jib build an image from whatever
+    # was on disk, which meant an image with no agent and no error - the container either failed
+    # to start or, worse, started with no instrumentation at all. Failing here turns that silent
+    # defect into a red job.
+    - name: Recover cached target dir
+      id: target-restore
+      uses: actions/cache/restore@v6
+      with:
+        path: target
+        key: ${{ runner.os }}-jdk${{ inputs.jdk-version }}-target-${{ github.run_id }}
+        fail-on-cache-miss: true
+
+    - name: Get project version
+      id: get-version
+      run: |
+        VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Image tag will be: $VERSION"
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+
+    # Deliberately `jib:build` alone, with no lifecycle phase.
+    #
+    # `mvn jib:build` is a direct goal invocation, so no `package`-bound execution runs here. That
+    # is fine because the `target` restored above already carries their output; the restore is now
+    # mandatory, so the case this guarded against - an image built with no javaagent - fails the
+    # job instead of shipping.
+    #
+    # Do NOT add `package` back. It re-runs the whole build in a job whose only purpose is to
+    # containerise what the `package` job produced. For a frontend service that means a second
+    # full npm install and Angular build: measured on event-registration-ui, this job went from
+    # 42s to a projected ~4min. It also fails outright where the frontend pulls a private package
+    # from GitHub Packages, because this job has no NODE_AUTH_TOKEN - which is exactly how
+    # registration-portal 2.4.10 failed to reach stage.
+    - name: Build and Publish
+      run: mvn jib:build --batch-mode --no-transfer-progress ${MAVEN_PROFILES:+-P"$MAVEN_PROFILES"}
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+        MAVEN_PROFILES: ${{ inputs.maven-profiles }}

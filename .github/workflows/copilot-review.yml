@@ -1,0 +1,65 @@
+name: '🤖 Request Copilot Review'
+# Requests a Copilot code review on newly opened pull requests.
+#
+# Why this exists: a Copilot review is billed to the *requester's* entitlement, never the
+# author's. Contributors without a Copilot subscription therefore never get one - not by
+# asking themselves, and not via the "Automatically request Copilot code review" branch
+# ruleset, which requests on the author's behalf and silently does nothing when the author
+# has no quota. Requesting under a PAT belonging to an account that does hold Copilot is
+# what closes the gap.
+#
+# Verified on event-admin-service#425: a request made by christhonie on a contributor's PR
+# produced a full review roughly three minutes later, with the contributor holding no
+# Copilot subscription of their own.
+
+on:
+  workflow_call:
+    secrets:
+      # A personal access token belonging to an account that holds a Copilot subscription,
+      # with "Pull requests: write" on the calling repository (classic PATs: the `repo`
+      # scope already covers it).
+      #
+      # Named to match the existing convention in gitflow-release-finish.yml, which uses
+      # RELEASE_PAT for the back-merge push.
+      #
+      # Optional only so a repository without the secret still parses. The GITHUB_TOKEN
+      # fallback runs as github-actions[bot], which holds no Copilot entitlement - the
+      # request is accepted but no review is ever produced, so the fallback is a diagnostic
+      # path, not a working one.
+      RELEASE_PAT:
+        required: false
+
+jobs:
+  request:
+    name: '🤖 Request Copilot Review'
+    runs-on: ubuntu-latest
+
+    # Three classes of pull request are not worth a premium request:
+    #   - Dependabot version bumps (29 open on membership-ui alone), which carry no
+    #     reviewable diff and cannot benefit from a review.
+    #   - The gitflow release and back-merge PRs opened by github-actions, whose content
+    #     has already been built, tested and merged by the time they exist.
+    #   - Drafts. They are picked up later by the ready_for_review trigger instead, which
+    #     mirrors the ruleset's review_draft_pull_requests: false.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.user.login != 'github-actions[bot]'
+
+    permissions:
+      # Governs the GITHUB_TOKEN fallback only; the PAT carries its own permissions.
+      pull-requests: write
+
+    steps:
+    - name: Request review from Copilot
+      env:
+        GH_TOKEN: ${{ secrets.RELEASE_PAT || github.token }}
+        PR: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        if ! gh api -X POST "repos/${REPO}/pulls/${PR}/requested_reviewers" \
+             -f "reviewers[]=copilot-pull-request-reviewer[bot]"; then
+          echo "::error::Could not request a Copilot review on ${REPO}#${PR}. The usual causes are that RELEASE_PAT lacks the 'Pull requests: write' permission, that its repository access list does not include ${REPO}, or that it has expired."
+          exit 1
+        fi
+        echo "::notice::Requested a Copilot review on ${REPO}#${PR}."

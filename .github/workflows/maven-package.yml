@@ -1,0 +1,111 @@
+name: '📦 Package'
+
+on: 
+  workflow_call:
+    inputs:
+      maven-profiles:
+        description: 'Comma-separated profiles to activate during packaging. Defaults to dev. Pass an empty string for projects that define no profiles.'
+        required: false
+        type: string
+        default: 'dev'
+      jdk-version:
+        description: 'JDK version to use. Defaults to 17.'
+        required: false
+        type: string
+        default: '17'
+      require-npm:
+        description: 'Should NodeJS and NPM packages be loaded?'
+        required: false
+        type: boolean
+        default: false
+      node-version:
+        description: 'Node version to use. Defaults to 22.'
+        required: false
+        type: string
+        default: '22'
+    secrets:
+      MAVEN_PASSWORD:
+        required: true
+
+# Account constants. Not inputs yet: one account uses these workflows. To serve a second account,
+# turn each into a workflow_call input with this value as its default.
+env:
+  MAVEN_SERVER_ID: github-christhonie    # distributionManagement/repository/id in the parent POM
+  MAVEN_USERNAME: christhonie
+  NPM_SCOPE: '@christhonie'
+
+jobs:
+  jar:
+    name: '📦 JAR'
+    runs-on: ubuntu-latest
+
+    steps:
+    - run: echo "Job triggered by a ${{ github.event_name }} event."
+    - run: echo "Running on a ${{ runner.os }} server hosted by GitHub"
+
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: ${{ inputs.jdk-version }}
+        distribution: 'temurin'
+        server-id: ${{ env.MAVEN_SERVER_ID }} # Value of the distributionManagement/repository/id field of the pom.xml
+        server-username: MAVEN_USERNAME # env variable for username in deploy
+        server-password: MAVEN_PASSWORD # env variable for token in deploy
+
+    # Cache Maven dependencies with run_id to ensure SNAPSHOT dependencies are refreshed each build
+    # while still benefiting from cache for stable dependencies via restore-keys fallback
+    - name: Cache Maven dependencies
+      uses: actions/cache@v6
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-
+          ${{ runner.os }}-maven-
+
+    - name: Remove cached SNAPSHOT dependencies
+      # mkdir guards the first ever run on a fresh repo, before any cache exists
+      # — find on a missing directory exits 1 and fails the job.
+      run: |
+        mkdir -p $HOME/.m2/repository
+        find $HOME/.m2/repository -type d -name '*SNAPSHOT' -exec rm -rf {} +
+
+    - name: Set up Node
+      uses: actions/setup-node@v7
+      if: inputs.require-npm
+      with:
+        node-version: ${{ inputs.node-version }}
+        registry-url: https://npm.pkg.github.com
+        scope: ${{ env.NPM_SCOPE }}
+        cache: 'npm'
+
+    - name: Cache npm dependencies
+      uses: actions/cache@v6
+      if: inputs.require-npm
+      with:
+        path: '**/node_modules'
+        key: ${{ runner.os }}-node${{ inputs.node-version }}-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node${{ inputs.node-version }}-
+
+    # ${VAR:+-P"$VAR"} omits the -P flag entirely when maven-profiles is empty.
+    # Passing a bare -P is a Maven usage error, and naming a profile the project
+    # does not define only produces a "could not be activated" warning — neither
+    # is a useful default for a project that simply has no profiles.
+    - name: Maven Package
+      run: mvn package -U --batch-mode --no-transfer-progress -DskipTests ${MAVEN_PROFILES:+-P"$MAVEN_PROFILES"}
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+        NODE_AUTH_TOKEN: ${{ secrets.MAVEN_PASSWORD }} #Assuming the same repo is used.
+        MAVEN_PROFILES: ${{ inputs.maven-profiles }}
+
+    - name: Cache target directory
+      id: target-save
+      uses: actions/cache/save@v6
+      with:
+        path: target
+        key: ${{ runner.os }}-jdk${{ inputs.jdk-version }}-target-${{ github.run_id }}

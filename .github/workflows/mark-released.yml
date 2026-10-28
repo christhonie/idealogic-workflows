@@ -1,0 +1,241 @@
+name: '🏷️ Mark Released'
+# When a release is tagged and reaches an environment, mark the Azure DevOps work items it shipped:
+# write the release into `Released In`, comment with the pull requests and the release page, and on
+# the stage bump (or the production promotion) comment "on <environment>" on each item and its
+# Testing tasks, copy `Released In` to its Deployment tasks and move the ones for that environment
+# to Active. Nothing changes state on a Story or Bug: Resolved happened at merge, Closed happens
+# once it is verified on stage.
+#
+# This is the release-marking step of the software factory's pull-request lifecycle route (R5).
+# Drafting the release notes needs a model; marking does not, so it is a deterministic script in
+# the same shape as the resolver, running as the factory's dispatcher principal through a federated
+# credential — no secret in GitHub.
+#
+# The release is the set of pull requests merged between the previous release tag (by version
+# order) and this one: every commit in that range is asked which merged pull requests contain it,
+# and the `release/*` pull request itself is left out. Ids are read from each head branch and
+# title, `ADO-<id>` and `agent-smith/<id>`, as the resolver reads them. Everything is idempotent:
+# a value already in `Released In` is not appended twice, and a comment the item already carries
+# is not repeated, so a replay by hand is safe.
+#
+# Callers: a `push-main` job after the Gitflow finish and the stage bump have both succeeded
+# (environment "stage"), and `workflow_dispatch` with a tag for a replay or for the production
+# promotion, which stays a human decision.
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: 'Workspace name of the component, as `Released In` records it: admin-service, admin-portal, registration-portal'
+        required: true
+        type: string
+      tag:
+        description: 'Release tag. Empty means the release tag on the commit that triggered the caller.'
+        required: false
+        type: string
+        default: ''
+      environment:
+        description: 'Environment the release has just reached: stage, production, or none for the tag alone'
+        required: false
+        type: string
+        default: 'none'
+      dry-run:
+        description: 'Report what would change and write nothing to Azure DevOps'
+        required: false
+        type: boolean
+        default: false
+      ado-organisation:
+        description: 'Azure DevOps organisation (the <org> of https://dev.azure.com/<org>)'
+        required: false
+        type: string
+        default: 'idealogic-za'
+      ado-project:
+        description: 'Azure DevOps project that holds the work items'
+        required: false
+        type: string
+        default: 'Event Membership'
+
+# Account constants. Not inputs yet: one account uses these workflows. To serve a second account,
+# turn each into a workflow_call input with this value as its default.
+env:
+  AZURE_CLIENT_ID: d45874b4-1e85-45ff-a740-42196b6d8da8    # ems-factory-dispatcher, the factory's dispatcher principal (not a secret)
+  AZURE_TENANT_ID: e0fd5785-e83e-439e-b7e7-5bfb0b2e8a84
+
+jobs:
+  mark:
+    name: '🏷️ Mark the release’s work items'
+    runs-on: ubuntu-latest
+    # One run at a time per repository: a stage run and a replay of the same tag serialise, and so
+    # do two releases close together. The tag cannot key the group, because the stage run learns
+    # it only after the job starts.
+    concurrency:
+      group: mark-released-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: read
+    steps:
+    - uses: azure/login@v2
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        allow-no-subscriptions: true
+
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Find the release and its pull requests
+      id: release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        TAG_INPUT: ${{ inputs.tag }}
+        ENVIRONMENT: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        case "$ENVIRONMENT" in stage|production|none|'') ;; *) echo "::error::environment must be stage, production or none, not '$ENVIRONMENT'"; exit 1;; esac
+        git fetch --tags --force --quiet
+        is_release='^v?[0-9]+\.[0-9]+\.[0-9]+$'    # 2.4.28, or v4.5.2 as the WordPress plugins tag
+        TAG="$TAG_INPUT"
+        if [ -z "$TAG" ]; then
+          TAG=$(git tag --points-at "$GITHUB_SHA" | grep -E "$is_release" | sort -V | tail -1 || true)
+          [ -n "$TAG" ] || { echo "::error::No release tag points at $GITHUB_SHA; the Gitflow finish must run first."; exit 1; }
+        fi
+        git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null || { echo "::error::Tag '$TAG' does not exist in $REPO"; exit 1; }
+        PREV=$(git tag -l | grep -E "$is_release" | sort -V | awk -v t="$TAG" '$0==t{print p; exit}{p=$0}')
+        if [ -n "$PREV" ]; then RANGE="$PREV..$TAG"; else RANGE="$TAG"; fi
+        echo "release $TAG, previous $PREV, range $RANGE"
+        : > prs.jsonl
+        for sha in $(git rev-list "$RANGE"); do
+          gh api "repos/$REPO/commits/$sha/pulls" \
+            --jq '.[] | select(.merged_at != null) | {number, base: .base.ref, head: .head.ref, title, url: .html_url}' >> prs.jsonl
+        done
+        sort -u prs.jsonl -o prs.jsonl
+        echo "$(wc -l < prs.jsonl) pull request rows over $(git rev-list --count "$RANGE") commits"
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "prev=$PREV" >> "$GITHUB_OUTPUT"
+
+    - name: Mark the work items
+      env:
+        ADO_ORG: ${{ inputs.ado-organisation }}
+        ADO_PROJECT: ${{ inputs.ado-project }}
+        REPO: ${{ github.repository }}
+        COMPONENT: ${{ inputs.component }}
+        TAG: ${{ steps.release.outputs.tag }}
+        PREV: ${{ steps.release.outputs.prev }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        TOKEN=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 -o tsv --query accessToken)
+        export TOKEN
+        python3 - <<'PY'
+        import json, os, re, html, sys, urllib.parse, urllib.request, urllib.error
+        ORG="https://dev.azure.com/"+os.environ["ADO_ORG"]; P=urllib.parse.quote(os.environ["ADO_PROJECT"])
+        H={"Authorization":"Bearer "+os.environ["TOKEN"]}
+        REPO=os.environ["REPO"]; TAG=os.environ["TAG"]; PREV=os.environ["PREV"]
+        ENV=os.environ["ENVIRONMENT"] if os.environ["ENVIRONMENT"] not in ("none","") else ""
+        DRY=os.environ["DRY_RUN"]=="true"
+        REL=f"{os.environ['COMPONENT']} {TAG}"
+        RUN=f'<a href="{os.environ["RUN_URL"]}">run</a>'
+        TAG_URL=f"https://github.com/{REPO}/releases/tag/{TAG}"
+        summary=[f"### Release marking — {REL}" + (f", on {ENV}" if ENV else ", tag only") + (" — DRY RUN, nothing written" if DRY else ""), ""]
+        def out(line): print(line); summary.append(f"- {line}")
+        def finish(): open(os.environ["GITHUB_STEP_SUMMARY"],"a").write("\n".join(summary)+"\n")
+        # --- the release's pull requests and the ids they name
+        prs={}
+        for line in open("prs.jsonl"):
+            if not line.strip(): continue
+            p=json.loads(line)
+            if p["base"] not in ("develop","main") or re.match(r"^release/",p["head"]): continue
+            prs[p["number"]]=p
+        ids={}
+        for n,p in sorted(prs.items()):
+            text=p["head"]+" "+p["title"]
+            found=sorted({int(x) for x in re.findall(r"ADO[- ]?#?(\d+)\b",text,re.I)} | {int(x) for x in re.findall(r"agent-smith/(\d+)\b",text,re.I)})
+            for i in found: ids.setdefault(i,[]).append(p)
+            if not found: out(f"PR #{n} names no work item: {p['title']}")
+        out(f"{len(prs)} pull requests since {PREV or 'the first release'}, naming {len(ids)} work items")
+        if not ids: finish(); sys.exit(0)
+        # --- Azure DevOps
+        def api(method,url,body=None,ct="application/json"):
+            req=urllib.request.Request(url,data=(json.dumps(body).encode() if body is not None else None),method=method,headers={**H,"Content-Type":ct})
+            with urllib.request.urlopen(req,timeout=60) as r: return json.load(r)
+        class Conflict(Exception): pass
+        def write(i,rev,ops,what):
+            # Every patch tests the revision it was built from: two repositories releasing one item
+            # at the same moment (a repository-local concurrency group cannot serialise them) then
+            # cannot overwrite each other's `Released In`; the loser re-reads and rebuilds.
+            if DRY: out(f"#{i}: would {what}"); return
+            try: api("PATCH",f"{ORG}/{P}/_apis/wit/workitems/{i}?api-version=7.1",[{"op":"test","path":"/rev","value":rev}]+ops,"application/json-patch+json")
+            except urllib.error.HTTPError as e:
+                if e.code==412: raise Conflict(i)
+                raise
+            out(f"#{i}: {what}")
+        def retrying(fn,i):
+            for attempt in range(4):
+                try: return fn()
+                except Conflict: out(f"#{i}: changed under us; re-read and retried")
+            raise RuntimeError(f"#{i}: still changing after four attempts")
+        def read(i): return api("GET",f"{ORG}/{P}/_apis/wit/workitems/{i}?$expand=relations&api-version=7.1")
+        def norm(t): return re.sub(r"\s+"," ",html.unescape(re.sub(r"<[^>]+>"," ",t or ""))).strip()
+        def comments(i):
+            # every page: a marker on an older comment must still be found
+            url=f"{ORG}/{P}/_apis/wit/workItems/{i}/comments?$top=200&api-version=7.1-preview.4"; texts=[]
+            while url:
+                r=api("GET",url); texts+=[norm(c["text"]) for c in r.get("comments",[])]
+                url=r.get("nextPage") or ""
+                if url and "api-version=" not in url: url+="&api-version=7.1-preview.4"
+            return texts
+        def released_in(fields):
+            cur=fields.get("Custom.ReleasedIn") or ""
+            return [v.strip() for v in re.split(r"[;,]\s*",cur) if v.strip()]
+        def field_op(vals): return {"op":"add","path":"/fields/Custom.ReleasedIn","value":"; ".join(vals+[REL])}
+        def comment_op(text): return {"op":"add","path":"/fields/System.History","value":f"<div>{text} Marked by the factory ({RUN}).</div>"}
+        def has(texts,pattern): return any(re.search(pattern,t) for t in texts)
+        on_env=re.escape(REL)+r"\b.*\bon "+re.escape(ENV)+r"\b" if ENV else None
+        env_text=(f"ArgoCD stage manifest bumped to {TAG}-RELEASE; ready for verification on stage before this item is Closed." if ENV=="stage"
+                  else "promoted to production.")
+        def mark_child(cid,i):
+            c=read(cid); cf=c["fields"]; act=cf.get("Microsoft.VSTS.Common.Activity"); cstate=cf.get("System.State")
+            if cstate in ("Closed","Removed"): return
+            if act=="Testing" and ENV:
+                if not has(comments(cid),on_env):
+                    write(cid,c["rev"],[comment_op(f"<b>{REL} is on {ENV}</b>: the criterion can be verified there now.")],f"Testing task of #{i}: on-{ENV} comment")
+            elif act=="Deployment":
+                cvals=released_in(cf); ctexts=comments(cid); cops=[]; cwhat=[]; cparts=[]
+                if REL not in cvals: cops.append(field_op(cvals)); cwhat.append(f"Released In += {REL}")
+                if not has(ctexts,r"Due with release "+re.escape(REL)+r"\b"): cparts.append(f"Due with release <b>{REL}</b>."); cwhat.append("due comment")
+                target=(cf.get("Custom.TargetEnvironment") or "").lower() or ("stage" if re.search(r"\(stage\)",cf["System.Title"],re.I) else "production" if re.search(r"\(prod(uction)?\)",cf["System.Title"],re.I) else "")
+                if ENV and target==ENV and cstate=="New":
+                    cops.append({"op":"add","path":"/fields/System.State","value":"Active"}); cparts.append(f"<b>Due now</b>: {REL} is on {ENV}."); cwhat.append("New → Active")
+                if cparts: cops.append(comment_op(" ".join(cparts)))
+                if cops: write(cid,c["rev"],cops,f"Deployment task of #{i}: "+", ".join(cwhat))
+        def mark_item(i):
+            w=read(i); f=w["fields"]; typ=f["System.WorkItemType"]; state=f["System.State"]
+            if typ in ("Epic","Feature","Goal"): out(f"#{i} {typ}: spans releases, not marked; skipped"); return []
+            links=", ".join(f'<a href="{p["url"]}">{REPO}#{p["number"]}</a>' for p in ids[i])
+            vals=released_in(f); texts=comments(i); ops=[]; parts=[]; what=[]
+            if REL not in vals: ops.append(field_op(vals)); what.append(f"Released In += {REL}")
+            if not has(texts,r"Released in "+re.escape(REL)+r"\b"):
+                parts.append(f'Released in <b>{REL}</b> ({links}): <a href="{TAG_URL}">{TAG}</a>.'); what.append("release comment")
+            if ENV and not has(texts,on_env):
+                parts.append(f"<b>{REL} is on {ENV}</b>: {env_text}"); what.append(f"on-{ENV} comment")
+            if parts: ops.append(comment_op(" ".join(parts)))
+            if ops: write(i,w["rev"],ops,"; ".join(what))
+            else: out(f"#{i} {typ}: already marked for {REL}" + (f" on {ENV}" if ENV else ""))
+            if state not in ("Resolved","Closed","Removed"): out(f"#{i} {typ}: still {state} — shipped in {REL} but not Resolved; state left for a person to judge")
+            return sorted(int(r["url"].rsplit("/",1)[1]) for r in w.get("relations",[]) if r.get("rel")=="System.LinkTypes.Hierarchy-Forward")
+        for i in sorted(ids):
+            try: kids=retrying(lambda: mark_item(i),i)
+            except urllib.error.HTTPError as e:
+                if e.code==404: out(f"#{i}: not found; skipped"); continue
+                raise   # 401/403/429/5xx fail the run so it is red and can be re-dispatched
+            # --- children: Testing tasks hear about the environment, Deployment tasks become due
+            for cid in kids: retrying(lambda: mark_child(cid,i),cid)
+        finish()
+        PY

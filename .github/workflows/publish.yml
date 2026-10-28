@@ -1,0 +1,50 @@
+name: '📰 Publish'
+
+on: 
+  workflow_call:
+    inputs:
+      jdk-version:
+        description: 'JDK version to use. Defaults to 17.'
+        required: false
+        type: string
+        default: '17'
+
+jobs:
+  zip:
+    name: '📁 ZIP'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: ${{ inputs.jdk-version }}
+        distribution: 'temurin'
+
+    # Cache Maven dependencies. Stable deps are reused via restore-keys fallback.
+    # SNAPSHOTs may be served stale — workflows that need fresh SNAPSHOTs
+    # (test-be.yml, maven-package.yml) explicitly purge them and run Maven with -U.
+    - name: Cache Maven dependencies
+      uses: actions/cache@v6
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-
+          ${{ runner.os }}-maven-
+
+    - name: Recover cached target dir
+      id: target-restore
+      uses: actions/cache/restore@v6
+      with:
+        path: target
+        key: ${{ runner.os }}-jdk${{ inputs.jdk-version }}-target-${{ github.run_id }}
+
+    - name: Save jar artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: Package
+        path: target/*.jar
+        retention-days: 14

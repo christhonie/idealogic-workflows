@@ -1,0 +1,104 @@
+name: '✅ Merge Eligibility'
+# Sets or clears the `ready-to-merge` label on one pull request.
+#
+# Why this exists: GitHub tracks every fact that makes a PR mergeable — reviews, threads, checks,
+# conflicts, drafts, `hold` — but no view shows "everything is in, only the merge is missing".
+# The operator merges by hand and needs a list of exactly those PRs. The label is that list: a
+# saved search over `label:ready-to-merge` is the dashboard. A person never applies or removes it.
+#
+# The rule (design journal 2026-10/sdlc-agent-orchestration, 2026-10-22, decision 2):
+#   open, not a draft, mergeable, no `hold`, every requested reviewer has submitted, no review is
+#   CHANGES_REQUESTED, every review thread is resolved or last answered by the PR author, and every
+#   check other than this workflow's own is green (success, neutral or skipped).
+#
+# Callers invoke it on review, thread, PR and CI-completion events. The evaluation is idempotent:
+# the label only changes when the verdict differs from the label's presence, so the `labeled` /
+# `unlabeled` events it causes converge after one extra run.
+
+on:
+  workflow_call:
+    inputs:
+      pr:
+        description: Pull request number to evaluate
+        required: true
+        type: number
+
+jobs:
+  evaluate:
+    name: '✅ Evaluate merge eligibility'
+    runs-on: ubuntu-latest
+    # One evaluation at a time per repository and PR, never cancelled: a later evaluation must
+    # read the state after an earlier one has written the label, or two overlapping runs can
+    # leave a stale verdict behind (A reads "eligible, unlabelled"; B sees a new blocking review
+    # and does nothing because the label is still absent; A then adds it from its old snapshot).
+    concurrency:
+      group: merge-eligibility-${{ github.repository }}-${{ inputs.pr }}
+      cancel-in-progress: false
+    permissions:
+      pull-requests: write
+      contents: read
+      checks: read
+      statuses: read
+    steps:
+    - name: Evaluate and set the label
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ inputs.pr }}
+        REPO: ${{ github.repository }}
+        # This job's own check-run name, as seen from the PR: callers prefix it with their job name
+        # ("merge-eligibility / ✅ Evaluate merge eligibility"), so it is matched by suffix.
+        SELF: '✅ Evaluate merge eligibility'
+      run: |
+        set -euo pipefail
+        OWNER="${REPO%/*}"; NAME="${REPO#*/}"
+        # Labels come from the REST view, which is complete; the GraphQL fields below are paged,
+        # so each carries pageInfo and a truncated page makes the PR ineligible rather than
+        # trusting an incomplete first page.
+        labels=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '[.labels[].name]')
+        json=$(gh api graphql -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -f query='
+          query($owner:String!,$name:String!,$pr:Int!){
+            repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+              state isDraft mergeable author{login}
+              reviewRequests(first:50){totalCount}
+              latestReviews: latestOpinionatedReviews(first:100){pageInfo{hasNextPage} nodes{state author{login}}}
+              reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved comments(last:1){nodes{author{login}}}}}
+              commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{
+                __typename ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}}}}}
+            }}}')
+        verdict=$(jq -c --arg self "$SELF" --argjson labels "$labels" '
+          .data.repository.pullRequest as $p
+          | ($p.commits.nodes[0].commit.statusCheckRollup.contexts // {nodes:[],pageInfo:{hasNextPage:false}}) as $roll
+          | ($roll.nodes // []) as $ctx
+          | ((($p.latestReviews.pageInfo.hasNextPage // false) or ($p.reviewThreads.pageInfo.hasNextPage // false) or ($roll.pageInfo.hasNextPage // false)) | not) as $complete
+          | ($ctx
+             | map(select(.__typename != "CheckRun" or ((.name | endswith($self)) | not)))
+             | map(if .__typename == "CheckRun"
+                   then (.status == "COMPLETED" and (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED"))
+                   else (.state == "SUCCESS") end)) as $checks
+          | { open: ($p.state == "OPEN"),
+              not_draft: ($p.isDraft | not),
+              mergeable: ($p.mergeable == "MERGEABLE"),
+              no_hold: (($labels | index("hold")) == null),
+              reviews_in: ($p.reviewRequests.totalCount == 0),
+              no_changes_requested: (($p.latestReviews.nodes | map(select(.state == "CHANGES_REQUESTED")) | length) == 0),
+              threads_done: (($p.reviewThreads.nodes
+                               | map(select(.isResolved | not))
+                               | map(select((.comments.nodes[0].author.login // "") != $p.author.login))
+                               | length) == 0),
+              checks_green: (($checks | length) > 0 and ($checks | all)),
+              complete: $complete,
+              has_label: (($labels | index("ready-to-merge")) != null) }
+          | . + { eligible: (.open and .not_draft and .mergeable and .no_hold and .reviews_in
+                             and .no_changes_requested and .threads_done and .checks_green and .complete) }' <<<"$json")
+        echo "$verdict" | jq .
+        eligible=$(jq -r .eligible <<<"$verdict"); has=$(jq -r .has_label <<<"$verdict")
+        if [ "$eligible" = true ] && [ "$has" = false ]; then
+          gh pr edit "$PR" --repo "$REPO" --add-label ready-to-merge
+          echo "::notice::ready-to-merge added to ${REPO}#${PR}"
+        elif [ "$eligible" = false ] && [ "$has" = true ]; then
+          gh pr edit "$PR" --repo "$REPO" --remove-label ready-to-merge
+          echo "::notice::ready-to-merge removed from ${REPO}#${PR}"
+        else
+          echo "::notice::${REPO}#${PR}: no change (eligible=${eligible}, labelled=${has})"
+        fi
+        { echo "### Merge eligibility — #${PR}"; echo; echo '```json'; jq . <<<"$verdict"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
