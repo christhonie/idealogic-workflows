@@ -116,13 +116,16 @@ jobs:
         def _items(htmltext):
             items=re.findall(r"<li[^>]*>(.*?)</li>",htmltext,re.S|re.I)
             if not items:
-                # Markdown. A line that starts at column 0 begins a criterion; an indented line is
-                # part of the one above it (a nested sub-item, or a wrapped continuation). Splitting
-                # on every line break made a task per sub-item (Bug: Story #529 → 14 tasks for 11).
-                items=[]
+                # Markdown. The first list marker sets the list's own indentation (Markdown allows
+                # up to three spaces before a top-level marker); a line indented deeper than that is
+                # part of the criterion above it (a nested sub-item, or a wrapped continuation).
+                # Splitting on every line break made a task per sub-item (Story #529 → 14 for 11).
+                items=[]; base=None
                 for line in re.split(r"<br\s*/?>|</p>|</div>|\n",htmltext):
                     if not line.strip(): continue
-                    if items and re.match(r"\s",line): items[-1]+=" "+line.strip()
+                    ind=len(re.match(r"^\s*",line).group().expandtabs(4))
+                    if base is None and re.match(r"^\s*(?:[-•*]|\d+[.)])\s",line): base=ind
+                    if items and base is not None and ind>base: items[-1]+=" "+line.strip()
                     else: items.append(line)
             clean=[]
             for it in items:
