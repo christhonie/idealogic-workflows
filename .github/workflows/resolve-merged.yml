@@ -120,6 +120,7 @@ jobs:
             return re.sub(r"\s+"," ",t).strip().casefold()
         def _items(htmltext):
             items=re.findall(r"<li[^>]*>(.*?)</li>",htmltext,re.S|re.I)
+            markdown=not items   # the inline-Markdown pass below is for Markdown input only
             if not items:
                 # Markdown. The first list marker sets the list's own indentation (Markdown allows
                 # up to three spaces before a top-level marker); a line indented deeper than that is
@@ -136,7 +137,8 @@ jobs:
             for it in items:
                 t=html.unescape(re.sub(r"<[^>]+>","",it))
                 t=re.sub(r"^\s*(?:[-•*]\s*)?\[\s*[xX ]?\s*\]\s*","",t)   # checklist markers
-                t=re.sub(r"\s+"," ",_inline(t)).strip(" \t\r\n-•*")          # then bullet markers
+                if markdown: t=re.sub(r"\s+"," ",_inline(t))                   # HTML items keep their text as is
+                t=t.strip(" \t\r\n-•*")                                      # then bullet markers
                 if len(t)>2: clean.append(t)
             return clean
         def criteria(fields):
