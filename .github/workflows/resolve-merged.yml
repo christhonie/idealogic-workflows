@@ -103,14 +103,28 @@ jobs:
         def patch(i,ops): return api("PATCH",f"{ORG}/{P}/_apis/wit/workitems/{i}?api-version=7.1",ops,"application/json-patch+json")
         sha=(pr.get("mergeCommit") or {}).get("oid","")[:10]
         link=f'<a href="{pr["url"]}">{os.environ["REPO"]}#{pr["number"]}</a>'
+        def _inline(t):
+            # inline Markdown is formatting, not text: **bold**, *italic*, `code`
+            t=re.sub(r"`([^`]*)`",r"\1",t)
+            t=re.sub(r"\*\*(.+?)\*\*",r"\1",t)
+            t=re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])",r"\1",t)
+            return t
         def _items(htmltext):
             items=re.findall(r"<li[^>]*>(.*?)</li>",htmltext,re.S|re.I)
             if not items:
-                items=re.split(r"<br\s*/?>|</p>|</div>|\n",htmltext)
+                # Markdown. A line that starts at column 0 begins a criterion; an indented line is
+                # part of the one above it (a nested sub-item, or a wrapped continuation). Splitting
+                # on every line break made a task per sub-item (Bug: Story #529 → 14 tasks for 11).
+                items=[]
+                for line in re.split(r"<br\s*/?>|</p>|</div>|\n",htmltext):
+                    if not line.strip(): continue
+                    if items and re.match(r"\s",line): items[-1]+=" "+line.strip()
+                    else: items.append(line)
             clean=[]
             for it in items:
                 t=html.unescape(re.sub(r"<[^>]+>","",it))
-                t=re.sub(r"^\s*(?:[-•*]\s*)?\[\s*[xX ]?\s*\]\s*","",t).strip(" \t\r\n-•*")   # checklist markers
+                t=re.sub(r"^\s*(?:[-•*]\s*)?\[\s*[xX ]?\s*\]\s*","",t)   # checklist markers
+                t=re.sub(r"\s+"," ",_inline(t)).strip(" \t\r\n-•*")          # then bullet markers
                 if len(t)>2: clean.append(t)
             return clean
         def criteria(fields):
