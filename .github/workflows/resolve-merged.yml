@@ -104,11 +104,15 @@ jobs:
         sha=(pr.get("mergeCommit") or {}).get("oid","")[:10]
         link=f'<a href="{pr["url"]}">{os.environ["REPO"]}#{pr["number"]}</a>'
         def _inline(t):
-            # inline Markdown is formatting, not text: **bold**, *italic*, `code`
-            t=re.sub(r"`([^`]*)`",r"\1",t)
+            # inline Markdown is formatting, not text: **bold**, *italic*, `code`. Code spans are
+            # held aside first so the emphasis passes cannot touch their contents (a glob such as
+            # `**/bin/**` is literal), then put back without the backticks.
+            spans=[]
+            def _hold(m): spans.append(m.group(1)); return f"\x00{len(spans)-1}\x00"
+            t=re.sub(r"`([^`]*)`",_hold,t)
             t=re.sub(r"\*\*(.+?)\*\*",r"\1",t)
             t=re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])",r"\1",t)
-            return t
+            return re.sub(r"\x00(\d+)\x00",lambda m:spans[int(m.group(1))],t)
         def _items(htmltext):
             items=re.findall(r"<li[^>]*>(.*?)</li>",htmltext,re.S|re.I)
             if not items:
