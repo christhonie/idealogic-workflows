@@ -113,6 +113,11 @@ jobs:
             t=re.sub(r"\*\*(.+?)\*\*",r"\1",t)
             t=re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])",r"\1",t)
             return re.sub(r"\x00(\d+)\x00",lambda m:spans[int(m.group(1))],t)
+        def _norm(title):
+            # the form two titles are compared in: inline Markdown gone, any stray marker left by an
+            # earlier resolver (which kept them, so "Trigger.**" is a legacy title) dropped, one space
+            t=re.sub(r"[`*]","",_inline(title))
+            return re.sub(r"\s+"," ",t).strip().casefold()
         def _items(htmltext):
             items=re.findall(r"<li[^>]*>(.*?)</li>",htmltext,re.S|re.I)
             if not items:
@@ -167,13 +172,13 @@ jobs:
             existing=set()
             if child_ids:
                 b=api("POST",f"{ORG}/{P}/_apis/wit/workitemsbatch?api-version=7.1",{"ids":child_ids,"fields":["System.Title","Microsoft.VSTS.Common.Activity"],"errorPolicy":"omit"})
-                existing={c["fields"]["System.Title"] for c in b["value"] if c["fields"].get("Microsoft.VSTS.Common.Activity")=="Testing"}
+                existing={_norm(c["fields"]["System.Title"]) for c in b["value"] if c["fields"].get("Microsoft.VSTS.Common.Activity")=="Testing"}
             prefix=(re.match(r"^\s*(\[[^\]]+\])",title) or [None,""])[1]
             full=criteria(f) if typ=="User Story" else [f"The fix for: {re.sub(r'^\s*\[[^\]]+\]\s*','',title)}"]
             wanted=[(f"{prefix} Verify: {c}".strip()[:255], c) for c in full] if typ=="User Story" else [(f"{prefix} Verify the fix on stage: {re.sub(r'^\s*\[[^\]]+\]\s*','',title)}".strip()[:255], full[0])]
             created=0
             for t,c in wanted:
-                if t in existing: continue
+                if _norm(t) in existing: continue   # a task made by an earlier resolver keeps its raw title
                 body=[{"op":"add","path":"/fields/System.Title","value":t},
                       {"op":"add","path":"/fields/System.AreaPath","value":f["System.AreaPath"]},
                       {"op":"add","path":"/fields/Microsoft.VSTS.Common.Activity","value":"Testing"},
@@ -190,7 +195,7 @@ jobs:
                 for c in sorted(b["value"],key=lambda c:c["id"]):
                     cf=c["fields"]
                     if cf.get("Microsoft.VSTS.Common.Activity")!="Testing" or cf.get("System.State")=="Removed": continue
-                    t=cf["System.Title"]
+                    t=_norm(cf["System.Title"])
                     if t in seen:
                         patch(c["id"],[{"op":"add","path":"/fields/System.State","value":"Removed"},
                                        {"op":"add","path":"/fields/System.History","value":f"<div>Duplicate of #{seen[t]} created by a concurrent resolver run; set to Removed by the resolver.</div>"}])
