@@ -1,0 +1,132 @@
+name: '⏩ Gitflow Start'
+# Cuts a release/* or hotfix/* branch with the gitflow Maven plugin and opens its pull request
+# into main. Replaces the per-repository manual-release-start.yml and manual-hotfix-start.yml,
+# which were thirteen near-identical copies - nine distinct file hashes, of which seven differed
+# only cosmetically.
+#
+# release-start is a workflow_dispatch trigger, so each repository keeps a wrapper. That is where
+# the security benefit comes from rather than a cost of it: the wrapper has no `run:` step, so a
+# dispatch input can no longer reach a shell as source text in any consuming repository.
+#
+# The thirteen copies interpolated the version straight into `run:` scripts. Actions substitutes a
+# ${{ }} expression into the script TEXT before bash parses it, which makes the input shell source;
+# the value sat in single quotes, so a single `'` closed them and the remainder executed in a step
+# holding the package-repository token. Only one repository validated the input at all, and that
+# check used `grep -qE`, which tests each LINE and succeeds if ANY line matches - so a version with
+# an embedded newline passed. See ADO #1899.
+#
+# Two guards, because validation alone would be one regex mistake away from a token disclosure:
+# the pattern is anchored to the whole string with [[ =~ ]], and every step that uses the version
+# takes it through `env:` so it is data rather than script text.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Target version, X.Y.Z.'
+        required: true
+        type: string
+      kind:
+        description: "'release' to branch from the dispatched ref, or 'hotfix' to branch from main."
+        required: false
+        type: string
+        default: 'release'
+      jdk-version:
+        description: 'JDK version to use. Defaults to 17.'
+        required: false
+        type: string
+        default: '17'
+    secrets:
+      # Read access to GitHub Packages, for repositories whose build resolves za.co.idealogic
+      # artifacts. Optional: where it is unset MAVEN_PASSWORD is empty, which is correct for the
+      # repositories that resolve nothing private (ems-pdf-invoice, event-info-plugin and the
+      # payment plugin each ran without it).
+      MAVEN_PASSWORD:
+        required: false
+
+# Account constants. Not inputs yet: one account uses these workflows. To serve a second account,
+# turn each into a workflow_call input with this value as its default.
+env:
+  MAVEN_SERVER_ID: github-christhonie    # distributionManagement/repository/id in the parent POM
+  MAVEN_USERNAME: christhonie
+
+jobs:
+  gitflow-start:
+    name: '⏩ Gitflow Start'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      # Never interpolated into a `run:` script - see the header.
+      VERSION: ${{ inputs.version }}
+      KIND: ${{ inputs.kind }}
+
+    steps:
+    - name: Validate inputs
+      # Runs before checkout so a bad input costs nothing. `kind` is validated too: it reaches a
+      # Maven goal name and a branch prefix, so a typo would otherwise surface as an opaque
+      # "unknown goal" failure part-way through.
+      shell: bash
+      run: |
+        if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::Version must be X.Y.Z, with no leading, trailing or embedded extra characters. Got: $(printf '%q' "$VERSION")"
+          exit 1
+        fi
+        if [[ "$KIND" != "release" && "$KIND" != "hotfix" ]]; then
+          echo "::error::kind must be 'release' or 'hotfix'. Got: $(printf '%q' "$KIND")"
+          exit 1
+        fi
+
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        # A hotfix branches from the released code, not from the ref it was dispatched on.
+        ref: ${{ inputs.kind == 'hotfix' && 'main' || github.ref }}
+
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: ${{ inputs.jdk-version }}
+        distribution: 'temurin'
+        server-id: ${{ env.MAVEN_SERVER_ID }} # Value of the distributionManagement/repository/id field of the pom.xml
+        server-username: MAVEN_USERNAME # env variable for username in deploy
+        server-password: MAVEN_PASSWORD # env variable for token in deploy
+
+    # Stable dependencies are reused via the restore-keys fallback. SNAPSHOTs may be served stale,
+    # which does not matter here: this job resolves the gitflow plugin and rewrites a version, it
+    # does not build the project (-DinstallProject=false).
+    - name: Cache Maven dependencies
+      uses: actions/cache@v6
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-
+          ${{ runner.os }}-maven-
+
+    - name: Setup git for commits
+      run: |
+        git config user.name "${GITHUB_ACTOR}"
+        git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+    - name: Create branch
+      shell: bash
+      run: |
+        mvn "gitflow:${KIND}-start" --batch-mode --no-transfer-progress \
+          "-D${KIND}Version=${VERSION}" -DinstallProject=false -DpushRemote=true
+      env:
+        # MAVEN_USERNAME comes from the workflow-level env block above.
+        MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+
+    - name: Create Pull Request
+      shell: bash
+      run: |
+        TITLE="${KIND^} ${VERSION}"
+        gh pr create -B main -H "${KIND}/${VERSION}" --title "$TITLE" \
+          --body "${TITLE} started by the Gitflow Start workflow."
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
