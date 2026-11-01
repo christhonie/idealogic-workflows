@@ -49,16 +49,49 @@ of the route workflows (`ado-organisation`, `ado-project`). None of these is a s
 | `publish.yml` | Upload JAR as GitHub artifact |
 | `dependencygraph.yml` | Submit dependency snapshot to GitHub |
 | `argocd-update.yml` | Update ArgoCD manifest with new image tag |
+| `gitflow-start.yml` | Cut a `release/*` or `hotfix/*` branch and open its pull request into main |
 | `gitflow-release-finish.yml` | Complete GitFlow release (tag, merge, bump version) |
 | `copilot-review.yml` | Request a Copilot code review on a new pull request |
 | `merge-eligibility.yml` | Keep the `ready-to-merge` label true to reviews, answered threads and green checks |
 | `resolve-merged.yml` | On a merge into develop, move the Azure DevOps items the PR names to Resolved and create their Testing tasks |
 | `mark-released.yml` | On a release, write `Released In`, the release comment and the on-environment comments on the items it shipped |
 
-Not here: `manual-release-start.yml`, the GitFlow release-start trigger. It is a
-`workflow_dispatch` workflow, not a reusable one, and each repository carries its own
-copy (for example `christhonie/event`). Making it reusable, with a thin dispatch caller
-per repository, is a later cleanup.
+`gitflow-start.yml` covers both release-start and hotfix-start, which differ only in the gitflow
+goal, the version property, the branch prefix and whether the branch is cut from `main`. It cannot
+be dispatched directly - a `workflow_call` workflow never can - so each repository keeps a
+`manual-release-start.yml` wrapper holding the `workflow_dispatch` trigger and nothing else:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Target version for this release.'
+        required: true
+        type: string
+jobs:
+  release-start:
+    uses: christhonie/idealogic-workflows/.github/workflows/gitflow-start.yml@main
+    # A called workflow cannot elevate the caller's token, so these are granted here rather
+    # than only in gitflow-start.yml. Where a repository's default workflow permissions are
+    # read-only, omitting them leaves the job unable to push the branch or open the pull
+    # request. Repositories whose default is read-write happen to work without this, which is
+    # exactly why it is easy to leave out and hard to notice.
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      version: ${{ inputs.version }}
+      kind: release
+    secrets:
+      MAVEN_PASSWORD: ${{ secrets.EVENT_PACKAGE_REPO_TOKEN }}
+```
+
+That the wrapper has no `run:` step is the point, not an accident. The thirteen copies this
+replaces each interpolated the dispatch input into a shell command, which made it shell source
+rather than data; with no `run:` step in the wrapper there is nowhere left in a consuming
+repository for that to happen. The version is validated here instead, once, against the whole
+string. See ADO #1899.
 
 ## Data Flow and Caching
 
