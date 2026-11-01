@@ -72,6 +72,14 @@ on:
 jobs:
   release-start:
     uses: christhonie/idealogic-workflows/.github/workflows/gitflow-start.yml@main
+    # A called workflow cannot elevate the caller's token, so these are granted here rather
+    # than only in gitflow-start.yml. Where a repository's default workflow permissions are
+    # read-only, omitting them leaves the job unable to push the branch or open the pull
+    # request. Repositories whose default is read-write happen to work without this, which is
+    # exactly why it is easy to leave out and hard to notice.
+    permissions:
+      contents: write
+      pull-requests: write
     with:
       version: ${{ inputs.version }}
       kind: release
