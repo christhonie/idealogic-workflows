@@ -108,13 +108,21 @@ jobs:
         PREV=$(git tag -l | grep -E "$is_release" | sort -V | awk -v t="$TAG" '$0==t{print p; exit}{p=$0}')
         if [ -n "$PREV" ]; then RANGE="$PREV..$TAG"; else RANGE="$TAG"; fi
         echo "release $TAG, previous $PREV, range $RANGE"
-        : > prs.jsonl
+        : > prs.jsonl; : > commits.tsv
         for sha in $(git rev-list "$RANGE"); do
-          gh api "repos/$REPO/commits/$sha/pulls" \
-            --jq '.[] | select(.merged_at != null) | {number, base: .base.ref, head: .head.ref, title, url: .html_url}' >> prs.jsonl
+          rows=$(gh api "repos/$REPO/commits/$sha/pulls" \
+            --jq '.[] | select(.merged_at != null) | {number, base: .base.ref, head: .head.ref, title, url: .html_url}')
+          [ -n "$rows" ] && echo "$rows" >> prs.jsonl
+          if [ "$(git show -s --format=%P "$sha" | wc -w)" -le 1 ]; then
+            # Every non-merge commit, with the pull requests it belongs to. Its subject may name
+            # items the pull request's branch and title do not: a hotfix's fixes are commits on
+            # the hotfix branch, inside a pull request titled "Hotfix X.Y.Z".
+            nums=$(printf '%s\n' "$rows" | jq -rs 'map(.number) | unique | join(",")' 2>/dev/null || true)
+            printf '%s\t%s\t%s\n' "$(git rev-parse --short "$sha")" "$nums" "$(git log -1 --format=%s "$sha")" >> commits.tsv
+          fi
         done
         sort -u prs.jsonl -o prs.jsonl
-        echo "$(wc -l < prs.jsonl) pull request rows over $(git rev-list --count "$RANGE") commits"
+        echo "$(wc -l < prs.jsonl) pull request rows and $(wc -l < commits.tsv) non-merge commits over $(git rev-list --count "$RANGE") commits"
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
         echo "prev=$PREV" >> "$GITHUB_OUTPUT"
 
@@ -153,13 +161,31 @@ jobs:
             p=json.loads(line)
             if p["base"] not in ("develop","main") or re.match(r"^release/",p["head"]): continue
             prs[p["number"]]=p
+        def _ids_of(text): return sorted({int(x) for x in re.findall(r"ADO[- ]?#?(\d+)\b",text,re.I)} | {int(x) for x in re.findall(r"agent-smith/(\d+)\b",text,re.I)})
         ids={}
         for n,p in sorted(prs.items()):
-            text=p["head"]+" "+p["title"]
-            found=sorted({int(x) for x in re.findall(r"ADO[- ]?#?(\d+)\b",text,re.I)} | {int(x) for x in re.findall(r"agent-smith/(\d+)\b",text,re.I)})
-            for i in found: ids.setdefault(i,[]).append(p)
-            if not found: out(f"PR #{n} names no work item: {p['title']}")
-        out(f"{len(prs)} pull requests since {PREV or 'the first release'}, naming {len(ids)} work items")
+            for i in _ids_of(p["head"]+" "+p["title"]): ids.setdefault(i,[]).append(p)
+        # --- commit subjects, for commits whose pull requests name no item (or that have none):
+        # a hotfix's fixes sit under a pull request titled "Hotfix X.Y.Z", so the subject is the
+        # only place "ADO-1865: …" appears. Credited to the pull request when there is one.
+        direct=0
+        for line in open("commits.tsv"):
+            if not line.strip(): continue
+            sha,nums,subj=line.rstrip("\n").split("\t",2)
+            found=_ids_of(subj)
+            if not found: continue
+            owners=[prs[int(n)] for n in nums.split(",") if n and int(n) in prs]
+            if any(_ids_of(p["head"]+" "+p["title"]) for p in owners): continue   # the pull request already names items
+            direct+=1
+            credit=owners or [{"label":f"@{sha}","title":subj,"url":f"https://github.com/{REPO}/commit/{sha}"}]
+            for i in found:
+                for p in credit:
+                    if p not in ids.setdefault(i,[]): ids[i].append(p)
+            via=("via PR " + ", ".join("#"+str(p["number"]) for p in owners)) if owners else "no pull request"
+            out(f"commit {sha} names {', '.join('#'+str(i) for i in found)} ({via}): {subj}")
+        for n,p in sorted(prs.items()):
+            if not any(p in v for v in ids.values()): out(f"PR #{n} names no work item: {p['title']}")
+        out(f"{len(prs)} pull requests and {direct} commits read by subject since {PREV or 'the first release'}, naming {len(ids)} work items")
         if not ids: finish(); sys.exit(0)
         # --- Azure DevOps
         def api(method,url,body=None,ct="application/json"):
@@ -218,7 +244,7 @@ jobs:
         def mark_item(i):
             w=read(i); f=w["fields"]; typ=f["System.WorkItemType"]; state=f["System.State"]
             if typ in ("Epic","Feature","Goal"): out(f"#{i} {typ}: spans releases, not marked; skipped"); return []
-            links=", ".join(f'<a href="{p["url"]}">{REPO}#{p["number"]}</a>' for p in ids[i])
+            links=", ".join(f'<a href="{p["url"]}">{REPO}{p.get("label") or "#"+str(p["number"])}</a>' for p in ids[i])
             vals=released_in(f); texts=comments(i); ops=[]; parts=[]; what=[]
             if REL not in vals: ops.append(field_op(vals)); what.append(f"Released In += {REL}")
             if not has(texts,r"Released in "+re.escape(REL)+r"\b"):
