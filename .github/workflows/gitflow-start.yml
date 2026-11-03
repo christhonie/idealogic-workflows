@@ -36,6 +36,14 @@ on:
         required: false
         type: string
         default: '17'
+      plugin-header-file:
+        description: >-
+          Path to a WordPress plugin's main PHP file whose header `Version:` line must be stamped
+          with this release's version on the new branch. Empty (the default) skips the stamping,
+          which is correct for every repository that keeps its version only in the POM.
+        required: false
+        type: string
+        default: ''
     secrets:
       # Read access to GitHub Packages, for repositories whose build resolves za.co.idealogic
       # artifacts. Optional: where it is unset MAVEN_PASSWORD is empty, which is correct for the
@@ -121,6 +129,52 @@ jobs:
       env:
         # MAVEN_USERNAME comes from the workflow-level env block above.
         MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+
+    # A WordPress plugin keeps its version in two places: pom.xml <revision>, which gitflow owns,
+    # and the plugin header in its main PHP file, which nothing owns.
+    #
+    # Stamping it HERE - on the new branch, before anything is tagged - means the tag, main and the
+    # develop back-merge all carry the right value, because everything downstream inherits from this
+    # branch. A consuming repository's pr-close-main.yml may also stamp the header, but that job runs
+    # after gitflow-release-finish, which is what tags the release and back-merges to develop: by then
+    # the tag already points at a commit whose header reads the PREVIOUS version, and develop never
+    # receives the bump at all. In the payment plugin, tags 2.2.2, 2.1.0 and 2.0.18 each shipped with
+    # a stale header for exactly that reason.
+    #
+    # This ran as a per-repository step until the wrappers were consolidated; it is an input here so
+    # that the wrapper can stay free of `run:` steps. See ADO #1899.
+    - name: Stamp the plugin header
+      if: inputs.plugin-header-file != ''
+      shell: bash
+      env:
+        HEADER_FILE: ${{ inputs.plugin-header-file }}
+      run: |
+        set -euo pipefail
+        git checkout "${KIND}/${VERSION}"
+
+        if [ ! -f "$HEADER_FILE" ]; then
+          echo "::error::plugin-header-file '${HEADER_FILE}' does not exist in this repository."
+          exit 1
+        fi
+
+        # Anchored to the header comment line, so a `Version:` appearing anywhere else in the file
+        # cannot be rewritten by accident.
+        sed -i -E "s|^([[:space:]]*\*[[:space:]]*Version:).*|\1 ${VERSION}|" "$HEADER_FILE"
+
+        # Read it back. A silent no-op here would ship a wrong version while the build stayed green,
+        # which is the failure this step exists to remove.
+        ACTUAL="$(sed -n -E 's|^[[:space:]]*\*[[:space:]]*Version:[[:space:]]*(.*)$|\1|p' "$HEADER_FILE" | head -1)"
+        if [ "$ACTUAL" != "$VERSION" ]; then
+          echo "::error::Plugin header reads '${ACTUAL}' after stamping, expected '${VERSION}'. The header format in ${HEADER_FILE} has probably changed - fix the pattern rather than shipping a wrong version."
+          exit 1
+        fi
+
+        if git diff --quiet -- "$HEADER_FILE"; then
+          echo "Plugin header already reads ${VERSION} - nothing to commit."
+        else
+          git commit -m "Set the plugin header version to ${VERSION}." -- "$HEADER_FILE"
+          git push origin "${KIND}/${VERSION}"
+        fi
 
     - name: Create Pull Request
       shell: bash
