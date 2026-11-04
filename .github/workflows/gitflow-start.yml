@@ -121,6 +121,22 @@ jobs:
         git config user.name "${GITHUB_ACTOR}"
         git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
 
+    # A second start for the same version used to fail deep inside the gitflow plugin with a
+    # rejected push, so the admin-service hotfix wrapper grew an explicit check. Consolidating the
+    # wrappers dropped it; this restores it here, for releases as well as hotfixes. A duplicate
+    # branch is worse than an opaque failure: gitflow-release-finish discovers the one in-flight
+    # release-or-hotfix branch, so a second one breaks the finish rather than just this job.
+    #
+    # One branch is finished before the next is started. To add to an open one, push to its branch
+    # and edit its pull request. Raised by review on admin-service PR #674.
+    - name: Refuse a branch that already exists
+      shell: bash
+      run: |
+        if git ls-remote --exit-code --heads origin "${KIND}/${VERSION}" >/dev/null 2>&1; then
+          echo "::error::${KIND}/${VERSION} already exists. Merge its pull request (and let the finish run) before starting another ${KIND}, or push the fix to that branch."
+          exit 1
+        fi
+
     - name: Create branch
       shell: bash
       run: |
