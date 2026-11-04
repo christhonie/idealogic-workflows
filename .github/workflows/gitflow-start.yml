@@ -157,15 +157,59 @@ jobs:
           exit 1
         fi
 
-        # Anchored to the header comment line, so a `Version:` appearing anywhere else in the file
-        # cannot be rewritten by accident.
-        sed -i -E "s|^([[:space:]]*\*[[:space:]]*Version:).*|\1 ${VERSION}|" "$HEADER_FILE"
+        # Both the rewrite and the read-back are confined to the plugin metadata block: the first
+        # comment block in the file, which is where WordPress requires the header to be.
+        #
+        # Scanning the whole file, as this first did, was not safe. Every matching line was
+        # rewritten, so a `Version:` in a later docblock was collateral damage, and the read-back
+        # then found that rewritten docblock and reported success while the real header stayed
+        # stale. Demonstrated before the fix: an unstarred `Version: 2.0.17` header followed by a
+        # starred ` * Version: 1.0.0` docblock passed the guard for 9.9.9 with the header untouched
+        # - a green build shipping the previous version, which is the exact failure this step is
+        # here to prevent. Raised by review on PR #4.
+        #
+        # The version line is matched with or without the leading `*`, because WordPress accepts a
+        # header either way, and its prefix is preserved. Zero matches, or more than one, is an
+        # unsupported or ambiguous layout: the step fails rather than guess which line is the
+        # header.
+        STAMP_AWK='
+          BEGIN { inblock = 0; seen = 0; hits = 0 }
+          {
+            line = $0
+            if (!seen && !inblock && line ~ /\/\*/) { inblock = 1 }
+            if (inblock && line ~ /^[[:space:]]*(\*[[:space:]]*)?Version:/) {
+              hits++
+              if (hits == 1) { sub(/Version:[[:space:]]*.*$/, "Version: " ver, line) }
+            }
+            print line
+            if (inblock && line ~ /\*\//) { inblock = 0; seen = 1 }
+          }
+          END { if (hits != 1) { exit 3 } }
+        '
+        READ_AWK='
+          BEGIN { inblock = 0; seen = 0 }
+          {
+            if (!seen && !inblock && $0 ~ /\/\*/) { inblock = 1 }
+            if (inblock && match($0, /^[[:space:]]*(\*[[:space:]]*)?Version:[[:space:]]*/)) {
+              print substr($0, RSTART + RLENGTH); exit
+            }
+            if (inblock && $0 ~ /\*\//) { inblock = 0; seen = 1 }
+          }
+        '
 
-        # Read it back. A silent no-op here would ship a wrong version while the build stayed green,
-        # which is the failure this step exists to remove.
-        ACTUAL="$(sed -n -E 's|^[[:space:]]*\*[[:space:]]*Version:[[:space:]]*(.*)$|\1|p' "$HEADER_FILE" | head -1)"
+        # The awk programs are single-quoted on assignment and passed as "$STAMP_AWK", so the `$0`
+        # inside them reaches awk intact - bash does not re-expand a variable's value.
+        if ! awk -v ver="$VERSION" "$STAMP_AWK" "$HEADER_FILE" > "${HEADER_FILE}.stamped"; then
+          echo "::error::Found no single Version: line in the plugin metadata block of ${HEADER_FILE} - either none or several. Fix the header layout, or this pattern, rather than shipping a wrong version."
+          exit 1
+        fi
+        mv "${HEADER_FILE}.stamped" "$HEADER_FILE"
+
+        # Read it back, by the same rule. A silent no-op here would ship a wrong version while the
+        # build stayed green, which is the failure this step exists to remove.
+        ACTUAL="$(awk "$READ_AWK" "$HEADER_FILE")"
         if [ "$ACTUAL" != "$VERSION" ]; then
-          echo "::error::Plugin header reads '${ACTUAL}' after stamping, expected '${VERSION}'. The header format in ${HEADER_FILE} has probably changed - fix the pattern rather than shipping a wrong version."
+          echo "::error::Plugin header reads '${ACTUAL}' after stamping, expected '${VERSION}' in ${HEADER_FILE}."
           exit 1
         fi
 
