@@ -44,6 +44,15 @@ on:
         required: false
         type: string
         default: ''
+      work-items:
+        description: >-
+          Work items this branch carries, comma-separated ids (for example 1866,1865). They go into
+          the pull request title, which is where the resolver and the release marking read ids from.
+          It matters most for a hotfix: its fixes are commits with no pull request of their own, so
+          without this nothing names them.
+        required: false
+        type: string
+        default: ''
     secrets:
       # Read access to GitHub Packages, for repositories whose build resolves za.co.idealogic
       # artifacts. Optional: where it is unset MAVEN_PASSWORD is empty, which is correct for the
@@ -236,11 +245,27 @@ jobs:
           git push origin "${KIND}/${VERSION}"
         fi
 
+    # The title names the work items, because the resolver and the release marking read ids from the
+    # head branch and the title only. A hotfix needs it: its fixes are commits with no pull request
+    # of their own, so nothing else names them, and a hotfix started without them resolves nothing
+    # and creates no Testing tasks. Raised by review on admin-service PR #674, where consolidating
+    # the wrapper had dropped the input. Ids can still be added later by editing the title.
     - name: Create Pull Request
       shell: bash
       run: |
         TITLE="${KIND^} ${VERSION}"
-        gh pr create -B main -H "${KIND}/${VERSION}" --title "$TITLE" \
-          --body "${TITLE} started by the Gitflow Start workflow."
+        BODY="${TITLE} started by the Gitflow Start workflow."
+
+        # Digits only, so an input written either as 1866 or as ADO-1866 yields one ADO-1866.
+        # `grep` exits 1 on no match, and `shell: bash` runs with `-o pipefail`, so without the
+        # `|| true` an empty input would end the step before the pull request was created.
+        NUMS="$(printf '%s' "$ITEMS" | grep -oE '[0-9]+' || true)"
+        if [ -n "$NUMS" ]; then
+          TITLE="$TITLE — $(printf '%s\n' "$NUMS" | sed 's/^/ADO-/' | paste -sd ',' - | sed 's/,/, /g')"
+          BODY="${BODY} The title names every work item it carries (ADO-n); the resolver and the release marking read ids from the head branch and the title. Edit the title if the set changes."
+        fi
+
+        gh pr create -B main -H "${KIND}/${VERSION}" --title "$TITLE" --body "$BODY"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        ITEMS: ${{ inputs.work-items }}

@@ -87,6 +87,21 @@ jobs:
       MAVEN_PASSWORD: ${{ secrets.EVENT_PACKAGE_REPO_TOKEN }}
 ```
 
+A hotfix wrapper should also pass `work-items`, the comma-separated ids the hotfix carries:
+
+```yaml
+    with:
+      version: ${{ inputs.version }}
+      kind: hotfix
+      work-items: ${{ inputs.work-items }}
+```
+
+They go into the pull request title, as `Hotfix 2.4.19 — ADO-1866, ADO-1865`. That is not
+cosmetic: the resolver and the release marking read ids from the head branch and the title only,
+and a hotfix's fixes are commits with no pull request of their own. Omit it and the hotfix resolves
+nothing and creates no Testing tasks. Ids can be added later by editing the title. A release does
+not need it, since its items arrive with the pull requests it carries.
+
 A WordPress plugin repository keeps its version in the plugin header as well as in the POM, and
 nothing else owns that header. Pass `plugin-header-file` and the header is stamped on the new
 branch, before anything is tagged, so the tag, `main` and the develop back-merge all carry the
