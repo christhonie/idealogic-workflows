@@ -87,6 +87,40 @@ jobs:
       MAVEN_PASSWORD: ${{ secrets.EVENT_PACKAGE_REPO_TOKEN }}
 ```
 
+A hotfix wrapper should also pass `work-items`, the comma-separated ids the hotfix carries:
+
+```yaml
+    with:
+      version: ${{ inputs.version }}
+      kind: hotfix
+      work-items: ${{ inputs.work-items }}
+```
+
+They go into the pull request title, as `Hotfix 2.4.19 — ADO-1866, ADO-1865`. That is not
+cosmetic: the resolver and the release marking read ids from the head branch and the title only,
+and a hotfix's fixes are commits with no pull request of their own. Omit it and the hotfix resolves
+nothing and creates no Testing tasks. Ids can be added later by editing the title. A release does
+not need it, since its items arrive with the pull requests it carries.
+
+A WordPress plugin repository keeps its version in the plugin header as well as in the POM, and
+nothing else owns that header. Pass `plugin-header-file` and the header is stamped on the new
+branch, before anything is tagged, so the tag, `main` and the develop back-merge all carry the
+right value:
+
+```yaml
+    with:
+      version: ${{ inputs.version }}
+      kind: release
+      plugin-header-file: event-payment-api.php
+```
+
+Stamping it anywhere later does not work. A `pr-close-main.yml` package job runs *after*
+`gitflow-release-finish`, which is what tags the release and back-merges to develop, so by then the
+tag already points at a commit whose header reads the previous version and develop never receives
+the bump. In the payment plugin, tags 2.2.2, 2.1.0 and 2.0.18 each shipped a stale header for that
+reason. The step reads the value back after writing it and fails the build on a mismatch, because a
+silent no-op would ship a wrong version while the build stayed green.
+
 That the wrapper has no `run:` step is the point, not an accident. The thirteen copies this
 replaces each interpolated the dispatch input into a shell command, which made it shell source
 rather than data; with no `run:` step in the wrapper there is nowhere left in a consuming

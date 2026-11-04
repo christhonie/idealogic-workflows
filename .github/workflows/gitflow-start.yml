@@ -36,6 +36,23 @@ on:
         required: false
         type: string
         default: '17'
+      plugin-header-file:
+        description: >-
+          Path to a WordPress plugin's main PHP file whose header `Version:` line must be stamped
+          with this release's version on the new branch. Empty (the default) skips the stamping,
+          which is correct for every repository that keeps its version only in the POM.
+        required: false
+        type: string
+        default: ''
+      work-items:
+        description: >-
+          Work items this branch carries, comma-separated ids (for example 1866,1865). They go into
+          the pull request title, which is where the resolver and the release marking read ids from.
+          It matters most for a hotfix: its fixes are commits with no pull request of their own, so
+          without this nothing names them.
+        required: false
+        type: string
+        default: ''
     secrets:
       # Read access to GitHub Packages, for repositories whose build resolves za.co.idealogic
       # artifacts. Optional: where it is unset MAVEN_PASSWORD is empty, which is correct for the
@@ -113,6 +130,22 @@ jobs:
         git config user.name "${GITHUB_ACTOR}"
         git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
 
+    # A second start for the same version used to fail deep inside the gitflow plugin with a
+    # rejected push, so the admin-service hotfix wrapper grew an explicit check. Consolidating the
+    # wrappers dropped it; this restores it here, for releases as well as hotfixes. A duplicate
+    # branch is worse than an opaque failure: gitflow-release-finish discovers the one in-flight
+    # release-or-hotfix branch, so a second one breaks the finish rather than just this job.
+    #
+    # One branch is finished before the next is started. To add to an open one, push to its branch
+    # and edit its pull request. Raised by review on admin-service PR #674.
+    - name: Refuse a branch that already exists
+      shell: bash
+      run: |
+        if git ls-remote --exit-code --heads origin "${KIND}/${VERSION}" >/dev/null 2>&1; then
+          echo "::error::${KIND}/${VERSION} already exists. Merge its pull request (and let the finish run) before starting another ${KIND}, or push the fix to that branch."
+          exit 1
+        fi
+
     - name: Create branch
       shell: bash
       run: |
@@ -122,11 +155,117 @@ jobs:
         # MAVEN_USERNAME comes from the workflow-level env block above.
         MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
 
+    # A WordPress plugin keeps its version in two places: pom.xml <revision>, which gitflow owns,
+    # and the plugin header in its main PHP file, which nothing owns.
+    #
+    # Stamping it HERE - on the new branch, before anything is tagged - means the tag, main and the
+    # develop back-merge all carry the right value, because everything downstream inherits from this
+    # branch. A consuming repository's pr-close-main.yml may also stamp the header, but that job runs
+    # after gitflow-release-finish, which is what tags the release and back-merges to develop: by then
+    # the tag already points at a commit whose header reads the PREVIOUS version, and develop never
+    # receives the bump at all. In the payment plugin, tags 2.2.2, 2.1.0 and 2.0.18 each shipped with
+    # a stale header for exactly that reason.
+    #
+    # This ran as a per-repository step until the wrappers were consolidated; it is an input here so
+    # that the wrapper can stay free of `run:` steps. See ADO #1899.
+    - name: Stamp the plugin header
+      if: inputs.plugin-header-file != ''
+      shell: bash
+      env:
+        HEADER_FILE: ${{ inputs.plugin-header-file }}
+      run: |
+        set -euo pipefail
+        git checkout "${KIND}/${VERSION}"
+
+        if [ ! -f "$HEADER_FILE" ]; then
+          echo "::error::plugin-header-file '${HEADER_FILE}' does not exist in this repository."
+          exit 1
+        fi
+
+        # Both the rewrite and the read-back are confined to the plugin metadata block: the first
+        # comment block in the file, which is where WordPress requires the header to be.
+        #
+        # Scanning the whole file, as this first did, was not safe. Every matching line was
+        # rewritten, so a `Version:` in a later docblock was collateral damage, and the read-back
+        # then found that rewritten docblock and reported success while the real header stayed
+        # stale. Demonstrated before the fix: an unstarred `Version: 2.0.17` header followed by a
+        # starred ` * Version: 1.0.0` docblock passed the guard for 9.9.9 with the header untouched
+        # - a green build shipping the previous version, which is the exact failure this step is
+        # here to prevent. Raised by review on PR #4.
+        #
+        # The version line is matched with or without the leading `*`, because WordPress accepts a
+        # header either way, and its prefix is preserved. Zero matches, or more than one, is an
+        # unsupported or ambiguous layout: the step fails rather than guess which line is the
+        # header.
+        STAMP_AWK='
+          BEGIN { inblock = 0; seen = 0; hits = 0 }
+          {
+            line = $0
+            if (!seen && !inblock && line ~ /\/\*/) { inblock = 1 }
+            if (inblock && line ~ /^[[:space:]]*(\*[[:space:]]*)?Version:/) {
+              hits++
+              if (hits == 1) { sub(/Version:[[:space:]]*.*$/, "Version: " ver, line) }
+            }
+            print line
+            if (inblock && line ~ /\*\//) { inblock = 0; seen = 1 }
+          }
+          END { if (hits != 1) { exit 3 } }
+        '
+        READ_AWK='
+          BEGIN { inblock = 0; seen = 0 }
+          {
+            if (!seen && !inblock && $0 ~ /\/\*/) { inblock = 1 }
+            if (inblock && match($0, /^[[:space:]]*(\*[[:space:]]*)?Version:[[:space:]]*/)) {
+              print substr($0, RSTART + RLENGTH); exit
+            }
+            if (inblock && $0 ~ /\*\//) { inblock = 0; seen = 1 }
+          }
+        '
+
+        # The awk programs are single-quoted on assignment and passed as "$STAMP_AWK", so the `$0`
+        # inside them reaches awk intact - bash does not re-expand a variable's value.
+        if ! awk -v ver="$VERSION" "$STAMP_AWK" "$HEADER_FILE" > "${HEADER_FILE}.stamped"; then
+          echo "::error::Found no single Version: line in the plugin metadata block of ${HEADER_FILE} - either none or several. Fix the header layout, or this pattern, rather than shipping a wrong version."
+          exit 1
+        fi
+        mv "${HEADER_FILE}.stamped" "$HEADER_FILE"
+
+        # Read it back, by the same rule. A silent no-op here would ship a wrong version while the
+        # build stayed green, which is the failure this step exists to remove.
+        ACTUAL="$(awk "$READ_AWK" "$HEADER_FILE")"
+        if [ "$ACTUAL" != "$VERSION" ]; then
+          echo "::error::Plugin header reads '${ACTUAL}' after stamping, expected '${VERSION}' in ${HEADER_FILE}."
+          exit 1
+        fi
+
+        if git diff --quiet -- "$HEADER_FILE"; then
+          echo "Plugin header already reads ${VERSION} - nothing to commit."
+        else
+          git commit -m "Set the plugin header version to ${VERSION}." -- "$HEADER_FILE"
+          git push origin "${KIND}/${VERSION}"
+        fi
+
+    # The title names the work items, because the resolver and the release marking read ids from the
+    # head branch and the title only. A hotfix needs it: its fixes are commits with no pull request
+    # of their own, so nothing else names them, and a hotfix started without them resolves nothing
+    # and creates no Testing tasks. Raised by review on admin-service PR #674, where consolidating
+    # the wrapper had dropped the input. Ids can still be added later by editing the title.
     - name: Create Pull Request
       shell: bash
       run: |
         TITLE="${KIND^} ${VERSION}"
-        gh pr create -B main -H "${KIND}/${VERSION}" --title "$TITLE" \
-          --body "${TITLE} started by the Gitflow Start workflow."
+        BODY="${TITLE} started by the Gitflow Start workflow."
+
+        # Digits only, so an input written either as 1866 or as ADO-1866 yields one ADO-1866.
+        # `grep` exits 1 on no match, and `shell: bash` runs with `-o pipefail`, so without the
+        # `|| true` an empty input would end the step before the pull request was created.
+        NUMS="$(printf '%s' "$ITEMS" | grep -oE '[0-9]+' || true)"
+        if [ -n "$NUMS" ]; then
+          TITLE="$TITLE — $(printf '%s\n' "$NUMS" | sed 's/^/ADO-/' | paste -sd ',' - | sed 's/,/, /g')"
+          BODY="${BODY} The title names every work item it carries (ADO-n); the resolver and the release marking read ids from the head branch and the title. Edit the title if the set changes."
+        fi
+
+        gh pr create -B main -H "${KIND}/${VERSION}" --title "$TITLE" --body "$BODY"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        ITEMS: ${{ inputs.work-items }}
