@@ -53,7 +53,7 @@ of the route workflows (`ado-organisation`, `ado-project`). None of these is a s
 | `gitflow-release-finish.yml` | Complete GitFlow release (tag, merge, bump version) |
 | `copilot-review.yml` | Request a Copilot code review on a new pull request |
 | `merge-eligibility.yml` | Keep the `ready-to-merge` label true to reviews, answered threads and green checks |
-| `resolve-merged.yml` | On a merge into develop, move the Azure DevOps items the PR names to Resolved and create their Testing tasks |
+| `resolve-merged.yml` | On a merge into develop, move the Azure DevOps items the PR names to Resolved and create their Testing tasks. A Design task (Activity = Design) is only linked, never closed |
 | `mark-released.yml` | On a release, write `Released In`, the release comment and the on-environment comments on the items it shipped |
 
 `gitflow-start.yml` covers both release-start and hotfix-start, which differ only in the gitflow

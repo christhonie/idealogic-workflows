@@ -4,14 +4,20 @@ name: '🧾 Resolve Merged'
 # one Testing task per acceptance criterion of each Story (one "verify the fix" task per Bug), so
 # the "to test on stage" list exists the moment the change is on develop.
 #
+# One kind of Task is not closed: a Task with Activity = Design. It tracks the design a Feature
+# still owes, its state is the flag, and a person closes it when the design is approved. Design
+# work merges pull requests long before that, so the merge is linked on the task in a comment and
+# its state is left alone.
+#
 # This is the resolver of the software factory's pull-request lifecycle route (R4). It is a
 # deterministic script, not a model: parsing ids and copying bullets into Tasks is a rule. It runs
 # as the factory's dispatcher principal through a federated credential — no secret in GitHub.
 #
 # Ids are read from the head branch and the title: `ADO-<id>` (EMS convention) and
 # `agent-smith/<id>` (Agent Smith's branch form), de-duplicated. A PR naming no item does nothing
-# and says so. Everything is idempotent: an item already Resolved or Closed is left alone, and a
-# Testing task whose title already exists under the parent is not created twice.
+# and says so. Everything is idempotent: an item already Resolved or Closed is left alone, a
+# Testing task whose title already exists under the parent is not created twice, and a Design task
+# that already carries a comment linking this pull request is not commented again.
 #
 # Callers: on `pull_request` closed-and-merged into develop, and `workflow_dispatch` with a PR
 # number for a missed merge.
@@ -162,6 +168,15 @@ jobs:
                 raise   # 401/403/429/5xx fail the run so it is red and can be re-dispatched
             f=w["fields"]; typ=f["System.WorkItemType"]; state=f["System.State"]; title=f["System.Title"]
             if typ in ("Epic","Feature","Goal"): out(f"#{i} {typ}: not resolved by a merge; skipped"); continue
+            if typ=="Task" and f.get("Microsoft.VSTS.Common.Activity")=="Design":
+                # The design a Feature still owes. A person closes it; a merge only records itself.
+                if state in ("Closed","Removed"): out(f"#{i} Design task already {state}; left as it is"); continue
+                cs=api("GET",f"{ORG}/{P}/_apis/wit/workItems/{i}/comments?$top=200&api-version=7.1-preview.4").get("comments",[])
+                if any(pr["url"] in (c.get("text") or "") for c in cs):
+                    out(f"#{i} Design task: state left at {state}; this pull request is already linked"); continue
+                patch(i,[{"op":"add","path":"/fields/System.History","value":f"<div>Merged into develop: {link} (merge {sha}). A merge does not close a Design task: state left at {state} by the factory resolver (<a href=\"{os.environ['RUN_URL']}\">run</a>).</div>"}])
+                out(f"#{i} Design task: state left at {state}; pull request linked in a comment")
+                continue
             target="Closed" if typ=="Task" else "Resolved"
             if state in ("Resolved","Closed","Removed"): out(f"#{i} {typ} already {state}; state untouched")
             else:
