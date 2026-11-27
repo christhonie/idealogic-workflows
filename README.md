@@ -51,7 +51,7 @@ of the route workflows (`ado-organisation`, `ado-project`). None of these is a s
 | `argocd-update.yml` | Update ArgoCD manifest with new image tag |
 | `gitflow-start.yml` | Cut a `release/*` or `hotfix/*` branch and open its pull request into main |
 | `gitflow-release-finish.yml` | Complete GitFlow release (tag, merge, bump version) |
-| `copilot-review.yml` | Request a Copilot code review on a new pull request |
+| `copilot-review.yml` | Request a Copilot code review on a pull request: on its own events, or by dispatch with the `pull-request` number |
 | `merge-eligibility.yml` | Keep the `ready-to-merge` label true to reviews, answered threads and green checks |
 | `resolve-merged.yml` | On a merge into develop, move the Azure DevOps items the PR names to Resolved and create their Testing tasks. A Design task (Activity = Design) is only linked, never closed |
 | `mark-released.yml` | On a release, write `Released In`, the release comment and the on-environment comments on the items it shipped |
